@@ -114,15 +114,39 @@ const statusEl = document.getElementById('status');
 
 // 送出點擊
 function sendClick(x, y) {
-  statusEl.textContent = `送出：x=${x}, y=${y} ...`;
+  const status = document.getElementById('status');
+  status.textContent = `送出：x=${x}, y=${y} ...`;
+
   fetch("/click", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ x, y })
   })
-  .then(r => r.json())
-  .then(d => statusEl.innerHTML = `狀態：<span class="ok">OK</span>（伺服器回覆 x=${d.x}, y=${d.y}）`)
-  .catch(err => statusEl.innerHTML = `狀態：<span class="err">ERROR</span> ${err}`);
+  .then(async (resp) => {
+    let d;
+    try {
+      d = await resp.json();
+    } catch (e) {
+      throw new Error(`Invalid JSON response: ${e}`);
+    }
+
+    if (d.busy) {
+      status.innerHTML = `<span class="err">Track is moving, wait to complete then click again.</span>`;
+      return;
+    }
+
+    if (!d.ok) {
+      status.innerHTML = `<span class="err">Error: ${d.error || 'unknown'}</span>`;
+      return;
+    }
+
+    status.innerHTML =
+      `狀態：<span class="ok">OK</span> （伺服器回覆 x=${d.x}, y=${d.y}）`;
+  })
+  .catch(err => {
+    status.innerHTML =
+      `狀態：<span class="err">Request failed: ${err.message || err}</span>`;
+  });
 }
 
 // 由滑鼠座標作 raycast
