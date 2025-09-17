@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <title>IVC Wall – Flask + Three.js (ESM)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #0b0e13; color: #e5e7eb; }
+    #info {
+      position: fixed; top: 10px; left: 12px; padding: 8px 10px; background: rgba(0,0,0,.45);
+      border-radius: 8px; font-size: 14px; line-height: 1.4; user-select: none;
+    }
+    a { color: #93c5fd; text-decoration: none; }
+    .ok { color: #34d399; }
+    .err { color: #f87171; }
+    canvas { cursor: crosshair; }
+  </style>
+</head>
+<body>
+  <div id="info">
+    <div>滑鼠移到前表面/右側面會紅色高亮；左鍵旋轉、右鍵平移、滾輪縮放。</div>
+    <div>點擊正面送 <code>{x:1..6, y:1..10}</code>；點擊最右柱右側面送 <code>{x:7, y:1..10}</code></div>
+    <div id="status">狀態：等待</div>
+  </div>
+
+  <!-- Use ES modules (no global THREE.*) -->
+  <script type="module" src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
