@@ -24,6 +24,8 @@ const INITIAL_VIEW = {
   zoom: 1
 };
 
+// ===== AGV Status Polling Config =====
+const AGV_STATUS_POLL_INTERVAL_MS = 2000; // Poll every 2 seconds
 
 // ===== 場景 =====
 const scene = new THREE.Scene();
@@ -111,11 +113,52 @@ for (let ix = 1; ix <= COLS; ix++) {
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 const statusEl = document.getElementById('status');
+let isAgvBusy = false; // New state variable for AGV busy status
+
+// Function to update the AGV busy status and UI
+function updateAgvBusyStatus(busy, message = "") {
+  isAgvBusy = busy;
+  if (isAgvBusy) {
+    statusEl.innerHTML = `<span class="err">AGV is busy: ${message || 'The previous job has not completed.'} Please wait.</span>`;
+  } else {
+    // Only clear the error message if it was an AGV busy message
+    if (statusEl.innerHTML.includes("AGV is busy")) {
+      statusEl.textContent = `AGV is ready. Click a cube to send commands.`;
+    }
+  }
+}
+
+// Polling function for AGV status
+async function pollAgvStatus() {
+  try {
+    const resp = await fetch("/agv/status-summary"); // New Flask endpoint
+    const data = await resp.json();
+
+    if (resp.ok && data.agv_busy !== undefined) {
+      updateAgvBusyStatus(data.agv_busy, data.agv_status_message);
+    } else {
+      console.error("Failed to fetch AGV status summary:", data);
+      updateAgvBusyStatus(true, data.error || "Could not get AGV status from server.");
+    }
+  } catch (error) {
+    console.error("Error polling AGV status:", error);
+    updateAgvBusyStatus(true, `Server communication error: ${error.message}`);
+  } finally {
+    setTimeout(pollAgvStatus, AGV_STATUS_POLL_INTERVAL_MS);
+  }
+}
 
 // 送出點擊
 function sendClick(x, y) {
-  const status = document.getElementById('status');
-  status.textContent = `送出：x=${x}, y=${y} ...`;
+  if (isAgvBusy) {
+    console.log("AGV is busy, preventing new command.");
+    // UI message already set by updateAgvBusyStatus
+    return;
+  }
+
+  statusEl.textContent = `送出：x=${x}, y=${y} ...`;
+  // Temporarily set AGV as busy to prevent rapid clicks while waiting for Flask response
+  updateAgvBusyStatus(true, "Sending command..."); 
 
   fetch("/click", {
     method: "POST",
@@ -130,22 +173,28 @@ function sendClick(x, y) {
       throw new Error(`Invalid JSON response: ${e}`);
     }
 
-    if (d.busy) {
-      status.innerHTML = `<span class="err">Track is moving, wait to complete then click again.</span>`;
+    if (d.agv_result && d.agv_result.busy) { // Flask reported AGV was busy AFTER fetch
+      updateAgvBusyStatus(true, d.agv_result.error || `AGV is busy, status: ${d.agv_result.status}`);
       return;
     }
-
+    
+    // Check overall `ok` status
     if (!d.ok) {
-      status.innerHTML = `<span class="err">Error: ${d.error || 'unknown'}</span>`;
+      statusEl.innerHTML = `<span class="err">Error: ${d.error || (d.agv_result ? d.agv_result.error : 'unknown')}</span>`;
+      updateAgvBusyStatus(true, d.error || (d.agv_result ? d.agv_result.error : 'unknown')); // Keep busy on general error
       return;
     }
 
-    status.innerHTML =
-      `狀態：<span class="ok">OK</span> （伺服器回覆 x=${d.x}, y=${d.y}）`;
+    // If both AGV and track are good
+    statusEl.innerHTML = `狀態：<span class="ok">OK</span> （伺服器回覆 x=${d.x}, y=${d.y}）`;
+    // AGV might be busy now due to the new task, or it might report not busy yet.
+    // The polling mechanism will eventually catch the real status.
+    updateAgvBusyStatus(true, "AGV task initiated, waiting for completion..."); 
   })
   .catch(err => {
-    status.innerHTML =
+    statusEl.innerHTML =
       `狀態：<span class="err">Request failed: ${err.message || err}</span>`;
+    updateAgvBusyStatus(true, `Request failed: ${err.message || err}`); // Keep busy on network errors
   });
 }
 
@@ -160,6 +209,8 @@ function setPointerFromEvent(event) {
 // hover 高亮（面）定位
 const EPS = 0.002; // 避免 Z-fighting 的微小偏移
 function showHoverFace(mesh, faceType /* 'front'|'right' */) {
+  if (isAgvBusy) return; // Don't show hover if busy
+
   hoverPlane.visible = true;
   hoverPlane.position.copy(mesh.position);
   hoverPlane.rotation.set(0,0,0); // reset
@@ -181,6 +232,10 @@ function hideHover() {
 
 // 滑鼠移動：更新 hover 面
 function onMouseMove(event) {
+  if (isAgvBusy) { // If busy, just hide hover and return
+    hideHover();
+    return;
+  }
   setPointerFromEvent(event);
   raycaster.setFromCamera(pointer, camera);
   const hits = raycaster.intersectObjects(pickMeshes, false);
@@ -206,6 +261,10 @@ function onMouseMove(event) {
 
 // 滑鼠點擊：依面型送出
 function onClick(event) {
+  if (isAgvBusy) {
+    console.log("AGV is busy, preventing click action.");
+    return;
+  }
   setPointerFromEvent(event);
   raycaster.setFromCamera(pointer, camera);
   const hits = raycaster.intersectObjects(pickMeshes, false);
@@ -243,6 +302,12 @@ window.addEventListener('resize', () => {
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
+
+// Start AGV status polling when the page loads
+window.onload = () => {
+  pollAgvStatus();
+};
+
 
 /* 下面的程式碼可協助你調整好視角後，直接把目前視角輸出成程式碼片段，貼回上方 INITIAL_VIEW 使用。
    如果不需要就註解掉即可。 */
