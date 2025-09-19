@@ -44,7 +44,10 @@ CLICK_ACC_MS = 100
 CLICK_DEC_MS = 100
 
 # ========= Y→position (cm) table =========
-CLICK_Y_STOPS_CM = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]  # index: y-1
+# CLICK_Y_STOPS_CM = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]  # index: y-1
+# [2.1, 20.2, 38.3, 56.4, 74.5, 92.6, 110.7, 128.8, 146.9, 165.0]
+CLICK_Y_STOPS_CM = [165 - (10 - i)*18.1 for i in range(1, 11)]
+
 
 # ========= AGV proxy config =========
 # per your note: base is 192.168.0.175:8080 (change via env if needed)
@@ -243,7 +246,7 @@ def send_and_receive_multi(
 
     time.sleep(INTER_CMD_DELAY) # Crucial delay for RS-485 turnaround
     
-    return read_messages_until(ser, overall_deadline_s=overall_deadline_s, idle_gap_s=idle_gap, req_id=req_id)
+    return read_messages_until(ser, overall_deadline_s=overall_deadline_s, idle_gap_s=idle_gap_s, req_id=req_id)
 
 def cm_to_units(cm: float) -> int:
     return int(round(cm * 1000.0))  # cm → 0.01mm
@@ -272,7 +275,8 @@ MSG_CLASS: Dict[str, Dict[str, str]] = {
     "OK":           {"type": "success", "text": "Command acknowledged/OK."} # Added for general acknowledgements
 }
 ERROR_CODES: Set[str] = {k for k, v in MSG_CLASS.items() if v["type"] == "error"}
-TERMINAL_OK: Set[str] = {"DONE", "HOME_OK", "RESTART_OK", "OK"} # Added "OK" as a potential terminal success
+# AFTER — remove "OK", keep it only as an informational ack
+TERMINAL_OK: Set[str] = {"DONE", "HOME_OK", "RESTART_OK"}
 
 # ========= AGV helpers =========
 def agv_url(path: str) -> str:
@@ -300,7 +304,7 @@ def agv_fetch_all(req_id: str = "") -> dict:
     resp.raise_for_status()
     return resp.json()
 
-def agv_send_task(target: str, req_id: str = "") -> dict:
+def send_task_to_agv(target: str, req_id: str = "") -> dict:
     url = agv_url("/YIDAGV/api/task/send-task")
     last_err = None
     for i in range(1, AGV_REQ_RETRIES + 1):
@@ -312,10 +316,15 @@ def agv_send_task(target: str, req_id: str = "") -> dict:
                 data = resp.json()
             except Exception:
                 data = {"error": resp.text}
+            # 同站點 → 視為成功（no-op），避免前端當成錯誤
+            msg = (data.get("message") or data.get("error") or "")
+            if resp.status_code == 400 and "current location is already the target tag number" in msg:
+                logging.warning(f"{req_id} [AGV] send-task noop: already at target ({target})")
+                return {"ok": True, "noop": True, "target": target, "message": msg}
             raise requests.HTTPError(f"send-task HTTP {resp.status_code}: {data}")
         except Exception as e:
             last_err = e
-            log.warning(f"{req_id} [AGV] send-task attempt {i}/{AGV_REQ_RETRIES} failed: {e}")
+            logging.warning(f"{req_id} [AGV] send-task attempt {i}/{AGV_REQ_RETRIES} failed: {e}")
             time.sleep(min(1.0 * i, 2.0))
     raise last_err
 
@@ -326,14 +335,25 @@ def agv_pick_one(agvs: list, agv_id: int) -> Optional[dict]:
     return None
 
 def agv_is_busy(agv: dict) -> bool:
-    t = (agv or {}).get("task")
-    working = bool((agv or {}).get("working"))
+    if not agv:
+        return True  # 沒資料就保守當成忙
+
+    t = agv.get("task")
+    working = bool(agv.get("working", False))
+
+    # 如果沒有任務，就單看 working
     if not t:
         return working
+
     status = str(t.get("status", "")).upper()
-    if status in ("COMPLETED", "FAILED"):
+
+    # 任務完成/失敗/取消/空閒 → 都算不忙
+    if status in ("COMPLETED", "FAILED", "CANCELLED", "NONE", "IDLE", "WAITING"):
         return False
-    return True or working
+
+    # 其他情況（RUNNING, STARTING, 等等）都算忙
+    return True
+
 
 def agv_task_status(agv: dict) -> Tuple[str, Optional[str]]:
     t = (agv or {}).get("task")
@@ -446,53 +466,90 @@ def api_agv_data():
 @app.get("/agv/status-summary")
 def api_agv_status_summary():
     rid_ = rid()
+    busy_track = track_busy()   # default
+    busy_agv = False
+    busy_combined = busy_track
+
     try:
         data = agv_fetch_all(req_id=rid_)
         agvs = data if isinstance(data, list) else data.get("data", [])
-        
-        # --- FIX IS HERE ---
-        # Original: ag = agv_pick_one(agvs, AGV_ID)  <-- This line should define 'agv', not 'ag'
-        # Corrected:
-        agv = agv_pick_one(agvs, AGV_ID) 
-        # --- END FIX ---
+        agv = agv_pick_one(agvs, AGV_ID)
 
         if not agv:
             msg = f"AGV id={AGV_ID} not found"
             log.error(f"{rid_} [AGV] status-summary: {msg}")
-            return jsonify({"ok": False, "agv_busy": True, "error": msg, "agv_status_message": msg}), 500
+            return jsonify({
+                "ok": False,
+                "agv_busy": True,         # be conservative on errors
+                "track_busy": busy_track,
+                "error": msg,
+                "agv_status_message": msg,
+                "agv_raw_status": {}
+            }), 500
 
-        busy = agv_is_busy(agv)
-        status, task_number = agv_task_status(agv)
-        message = f"Status: {status}"
+        # ★ compute both, then OR
+        busy_agv = agv_is_busy(agv)
+        busy_combined = busy_agv or busy_track
+
+        status_text, task_number = agv_task_status(agv)
+        message = f"Status: {status_text}"
         if task_number:
             message += f", Task: {task_number}"
+        if busy_track:
+            message += " | Track: MOVING"
 
         return jsonify({
             "ok": True,
-            "agv_busy": busy,
+            "agv_busy": busy_combined,     # ← front-end uses this
+            "track_busy": busy_track,
+            "agv_busy_raw": busy_agv,
             "agv_status_message": message,
-            "agv_raw_status": agv # Optional: for more detailed debugging on frontend
+            "agv_raw_status": agv
         })
+
     except requests.exceptions.RequestException as e:
         log.error(f"{rid_} [AGV] status-summary: HTTP request failed: {e}")
-        return jsonify({"ok": False, "agv_busy": True, "error": str(e), "agv_status_message": "Failed to connect to AGV system."}), 502
+        return jsonify({
+            "ok": False,
+            "agv_busy": True,
+            "track_busy": busy_track,
+            "error": str(e),
+            "agv_status_message": "Failed to connect to AGV system."
+        }), 502
     except Exception as e:
         log.error(f"{rid_} [AGV] status-summary: Unexpected error: {e}")
-        return jsonify({"ok": False, "agv_busy": True, "error": str(e), "agv_status_message": "Server error checking AGV status."}), 500
-        
+        return jsonify({
+            "ok": False,
+            "agv_busy": True,
+            "track_busy": busy_track,
+            "error": str(e),
+            "agv_status_message": "Server error checking AGV status."
+        }), 500
+
 @app.post("/agv/send-task")
 def api_agv_send_task():
     rid_ = rid()
     payload = request.get_json(silent=True) or {}
-    target = str(payload.get("target", ""))
+    target = str(payload.get("target", "")).strip()
     if not target:
         return jsonify({"ok": False, "error": "missing target"}), 400
     try:
-        data = agv_send_task(target, req_id=rid_)
+        data = send_task_to_agv(target, req_id=rid_)
         return jsonify({"ok": True, **(data if isinstance(data, dict) else {})})
     except Exception as e:
         log.error(f"{rid_} [AGV] send-task error: {e}")
         return jsonify({"ok": False, "error": f"send-task failed: {e}"}), 502
+
+@app.post("/agv/home")
+def api_agv_home():
+    rid_ = rid()
+    try:
+        data = send_task_to_agv("1001", req_id=rid_)
+        return jsonify({"ok": True, **(data if isinstance(data, dict) else {})})
+    except Exception as e:
+        log.error(f"{rid_} [AGV] home error: {e}")
+        return jsonify({"ok": False, "error": f"home failed: {e}"}), 502
+
 
 # ---- Main /click: AGV (sync) first, then Track (async worker) ----
 @app.post("/click")
@@ -538,7 +595,7 @@ def click():
                     agv_result = {"ok": False, "error": msg, "base": AGV_BASE_URL}
                 else:
                     try:
-                        st_resp = agv_send_task(target, req_id=rid_)
+                        st_resp = send_task_to_agv(target, req_id=rid_)
                         task_number = st_resp.get("taskNumber") if isinstance(st_resp, dict) else None
                         agv_result = {"ok": True, "target": target, "taskNumber": task_number, "base": AGV_BASE_URL}
                         log.info(f"{rid_} [AGV] send-task OK target={target} taskNumber={task_number}")
