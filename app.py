@@ -7,7 +7,7 @@ import signal
 import threading
 from typing import Optional, List, Dict, Set, Tuple
 
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, Response
 import serial
 import requests
 import logging
@@ -24,7 +24,6 @@ logging.basicConfig(
 log = logging.getLogger("ivc")
 
 def rid() -> str:
-    # simple request id like [HH:MM:SS.mmm]
     return f"[{time.strftime('%H:%M:%S')}.{int((time.time()%1)*1000):03d}]"
 
 # ========= Serial & timing config =========
@@ -33,8 +32,8 @@ RS485_BAUD = int(os.getenv("RS485_BAUD", "115200"))
 RS485_BYTESIZE = 8        # 8O1
 RS485_PARITY = "O"
 RS485_STOPBITS = 1
-RS485_TIMEOUT = float(os.getenv("RS485_TIMEOUT", "0.5"))     # per-byte timeout (s), reduced for quicker error detection
-INTER_CMD_DELAY = float(os.getenv("INTER_CMD_DELAY", "0.100")) # Increased to 100ms for RS-485 turnaround
+RS485_TIMEOUT = float(os.getenv("RS485_TIMEOUT", "0.5"))
+INTER_CMD_DELAY = float(os.getenv("INTER_CMD_DELAY", "0.100"))
 READ_DEADLINE_DEFAULT = float(os.getenv("RS485_READ_DEADLINE", "60.0"))
 IDLE_GAP_DEFAULT = float(os.getenv("RS485_IDLE_GAP", "1.0"))
 
@@ -42,67 +41,53 @@ IDLE_GAP_DEFAULT = float(os.getenv("RS485_IDLE_GAP", "1.0"))
 CLICK_VEL = 5000
 CLICK_ACC_MS = 100
 CLICK_DEC_MS = 100
-
-# ========= Y→position (cm) table =========
-# CLICK_Y_STOPS_CM = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100]  # index: y-1
-# [2.1, 20.2, 38.3, 56.4, 74.5, 92.6, 110.7, 128.8, 146.9, 165.0]
 CLICK_Y_STOPS_CM = [165 - (10 - i)*18.1 for i in range(1, 11)]
 
-
 # ========= AGV proxy config =========
-# per your note: base is 192.168.0.175:8080 (change via env if needed)
 AGV_BASE_URL = os.getenv("AGV_BASE_URL", "http://192.168.0.172:8080")
 AGV_ID = int(os.getenv("AGV_ID", "1"))
-
-# Map X to AGV targets (strings). Adjust as needed.
 AGV_TARGETS = json.loads(os.getenv("AGV_TARGETS_JSON", json.dumps({
     "1": "1002", "2": "1003", "3": "1004", "4": "1005", "5": "1006", "6": "1007", "7": "1009"
 })))
-
-# HTTP timeouts & retries
-AGV_REQ_TIMEOUT_S = float(os.getenv("AGV_REQ_TIMEOUT_S", "3.0"))  # per request
-AGV_REQ_RETRIES = int(os.getenv("AGV_REQ_RETRIES", "3"))          # send-task retries
+AGV_REQ_TIMEOUT_S = float(os.getenv("AGV_REQ_TIMEOUT_S", "3.0"))
+AGV_REQ_RETRIES = int(os.getenv("AGV_REQ_RETRIES", "3"))
 
 CR = b"\r"
 app = Flask(__name__)
-
 log.info(f"[BOOT] AGV_BASE_URL = {AGV_BASE_URL}")
 
 # ========= Persistent serial state =========
 SER: Optional[serial.Serial] = None
-SER_LOCK = threading.Lock()     # guards read/write to SER
-_TRACK_LOCK = threading.Lock()  # ensures only one track job at a time
-
-# Event to signal worker threads to stop
+SER_LOCK = threading.Lock()
+_TRACK_LOCK = threading.Lock()
 _SHUTDOWN_EVENT = threading.Event()
 
 def track_busy() -> bool:
     return _TRACK_LOCK.locked()
 
 def open_serial_port() -> serial.Serial:
-    byte_size_map = {5: serial.FIVEBITS, 6: serial.SIXBITS, 7: serial.SEVENBITS, 8: serial.EIGHTBITS}
-    parity_map = {'N': serial.PARITY_NONE, 'E': serial.PARITY_EVEN, 'O': serial.PARITY_ODD,
-                  'M': serial.PARITY_MARK, 'S': serial.PARITY_SPACE}
-    stop_map = {1: serial.STOPBITS_ONE, 2: serial.STOPBITS_TWO}
-    ser = serial.Serial(
+    import serial as _serial
+    byte_size_map = {5: _serial.FIVEBITS, 6: _serial.SIXBITS, 7: _serial.SEVENBITS, 8: _serial.EIGHTBITS}
+    parity_map = {'N': _serial.PARITY_NONE, 'E': _serial.PARITY_EVEN, 'O': _serial.PARITY_ODD,
+                  'M': _serial.PARITY_MARK, 'S': _serial.PARITY_SPACE}
+    stop_map = {1: _serial.STOPBITS_ONE, 2: _serial.STOPBITS_TWO}
+    ser = _serial.Serial(
         port=RS485_PORT,
         baudrate=RS485_BAUD,
-        bytesize=byte_size_map.get(RS485_BYTESIZE, serial.EIGHTBITS),
-        parity=parity_map.get(RS485_PARITY.upper(), serial.PARITY_ODD),
-        stopbits=stop_map.get(RS485_STOPBITS, serial.STOPBITS_ONE),
+        bytesize=byte_size_map.get(RS485_BYTESIZE, _serial.EIGHTBITS),
+        parity=parity_map.get(RS485_PARITY.upper(), _serial.PARITY_ODD),
+        stopbits=stop_map.get(RS485_STOPBITS, _serial.STOPBITS_ONE),
         timeout=RS485_TIMEOUT,
         write_timeout=RS485_TIMEOUT,
-        rtscts=False, dsrdtr=False, xonxoff=False # Typically false for RS-485
+        rtscts=False, dsrdtr=False, xonxoff=False
     )
     return ser
 
 def serial_init(retries: int = 3, delay_s: float = 1.0):
-    """Open the RS-485 port, with retries, and keep it for the whole app lifetime."""
     global SER
     if SER and getattr(SER, "is_open", False):
         log.info("[BOOT] Serial port already open.")
         return SER
-
     for i in range(retries):
         try:
             log.info(f"[BOOT] Attempt {i+1}/{retries} to open serial {RS485_PORT} {RS485_BAUD}bps 8{RS485_PARITY}1 timeout={RS485_TIMEOUT}s")
@@ -111,7 +96,7 @@ def serial_init(retries: int = 3, delay_s: float = 1.0):
             return SER
         except serial.SerialException as e:
             log.warning(f"[BOOT] Serial open failed: {e}. Retrying in {delay_s}s...")
-            SER = None # Ensure SER is None if opening fails
+            SER = None
             time.sleep(delay_s)
         except Exception as e:
             log.error(f"[BOOT] Unexpected error during serial init: {e}")
@@ -121,13 +106,10 @@ def serial_init(retries: int = 3, delay_s: float = 1.0):
     return None
 
 def serial_close():
-    """Close the port at shutdown."""
     global SER
-    # Signal workers to stop gracefully before trying to close serial
-    _SHUTDOWN_EVENT.set() 
+    _SHUTDOWN_EVENT.set()
     log.info("[SHUTDOWN] Signaled worker threads to stop.")
-
-    with SER_LOCK: # Acquire lock before accessing SER to prevent race conditions during shutdown
+    with SER_LOCK:
         try:
             if SER and getattr(SER, "is_open", False):
                 log.info("[SHUTDOWN] closing serial")
@@ -139,128 +121,14 @@ def serial_close():
             SER = None
 
 def serial_get_or_raise() -> serial.Serial:
-    """Return open serial or raise if not available. Attempts re-init if closed."""
     global SER
     if SER and getattr(SER, "is_open", False):
         return SER
-    
     log.warning("[SERIAL] Serial port not open, attempting re-initialization.")
-    SER = serial_init(retries=1, delay_s=0.5) # Try to re-init once
+    SER = serial_init(retries=1, delay_s=0.5)
     if SER and getattr(SER, "is_open", False):
         return SER
     raise serial.SerialException("Serial port is not available or could not be re-opened.")
-
-# ========= TRACK helpers =========
-def make_command(head: str, *args: int) -> bytes:
-    head = head.strip().upper()
-    parts = [head] + [str(int(v)) for v in args]
-    return ",".join(parts).encode("ascii") + CR
-
-def read_messages_until(
-    ser: serial.Serial,
-    overall_deadline_s: float,
-    idle_gap_s: Optional[float] = None,
-    req_id: str = ""
-) -> Optional[List[str]]:
-    lines: List[str] = []
-    buf = bytearray()
-    start_time = time.monotonic()
-    last_rx_time = start_time
-    got_any_data = False
-
-    while True:
-        now = time.monotonic()
-
-        # Check for shutdown signal
-        if _SHUTDOWN_EVENT.is_set():
-            log.info(f"{req_id} [TRACK] read: Shutdown event received, stopping read.")
-            return None
-
-        # Check overall deadline
-        if (now - start_time) > overall_deadline_s:
-            log.warning(f"{req_id} [TRACK] read: overall deadline ({overall_deadline_s:.1f}s) exceeded.")
-            break
-
-        # Check idle gap only if we've received some data
-        if got_any_data and idle_gap_s is not None and (now - last_rx_time) > idle_gap_s:
-            log.info(f"{req_id} [TRACK] read: idle gap ({idle_gap_s:.2f}s) reached (stopping read).")
-            break
-
-        try:
-            # Use a smaller timeout for serial.read() if a shutdown event is possible
-            # This allows the loop to frequently check _SHUTDOWN_EVENT
-            read_timeout = min(RS485_TIMEOUT, 0.1) # Check every 100ms
-            b = ser.read(1) # This uses the per-byte timeout (RS485_TIMEOUT)
-        except serial.SerialTimeoutException:
-            # This can happen if no byte arrives within read_timeout
-            # If we haven't received anything yet, it's a "no data" issue
-            if not got_any_data:
-                log.debug(f"{req_id} [TRACK] read: No initial byte within {read_timeout:.1f}s.")
-            continue # Continue checking deadlines
-
-        if b:
-            got_any_data = True
-            buf.extend(b)
-            last_rx_time = now # Update last received time
-            
-            if b == CR:
-                line = bytes(buf[:-1]).decode("ascii", errors="replace").strip()
-                buf = bytearray() # Reset buffer for next line
-                if line:
-                    lines.append(line)
-                    log.info(f"{req_id} [TRACK] <- {line}")
-                    if line in TERMINAL_OK or line in ERROR_CODES:
-                        log.info(f"{req_id} [TRACK] read: Terminal message '{line}' received.")
-                        break
-        # If no byte received (b is empty), the loop will continue and check deadlines.
-        # This occurs if the per-byte timeout (RS485_TIMEOUT) expires.
-    
-    if not lines:
-        log.warning(f"{req_id} [TRACK] No complete lines received within deadline or before idle gap.")
-        return None
-    return lines
-
-
-def send_and_receive_multi(
-    ser: serial.Serial,
-    cmd_bytes: bytes,
-    overall_deadline_s: float,
-    idle_gap_s: Optional[float],
-    req_id: str = ""
-) -> Optional[List[str]]:
-    ser.reset_input_buffer()
-    ser.reset_output_buffer()
-    log.info(f"{req_id} [TRACK] -> {cmd_bytes!r}")
-    
-    try:
-        ser.write(cmd_bytes)
-        ser.flush()
-    except serial.SerialException as e:
-        log.error(f"{req_id} [TRACK] Write failed: {e}")
-        return None
-    
-    # Check shutdown event before sleeping
-    if _SHUTDOWN_EVENT.is_set():
-        log.info(f"{req_id} [TRACK] Shutdown event received before INTER_CMD_DELAY, stopping.")
-        return None
-
-    time.sleep(INTER_CMD_DELAY) # Crucial delay for RS-485 turnaround
-    
-    return read_messages_until(ser, overall_deadline_s=overall_deadline_s, idle_gap_s=idle_gap_s, req_id=req_id)
-
-def cm_to_units(cm: float) -> int:
-    return int(round(cm * 1000.0))  # cm → 0.01mm
-
-def classify_messages(lines: List[str]) -> List[Dict[str, str]]:
-    out: List[Dict[str, str]] = []
-    for raw in lines:
-        key = raw.strip()
-        meta = MSG_CLASS.get(key)
-        if meta is None:
-            out.append({"code": key, "type": "info", "text": key})
-        else:
-            out.append({"code": key, "type": meta["type"], "text": meta["text"]})
-    return out
 
 # ========= Message classes =========
 MSG_CLASS: Dict[str, Dict[str, str]] = {
@@ -272,17 +140,15 @@ MSG_CLASS: Dict[str, Dict[str, str]] = {
     "ERROR_DRIVER": {"type": "error",   "text": "Motor driver fault."},
     "ERROR_INPOS":  {"type": "error",   "text": "Position not reached / in-position error."},
     "NOT_HOME_OK":  {"type": "error",   "text": "Not at HOME (reported as OK)."},
-    "OK":           {"type": "success", "text": "Command acknowledged/OK."} # Added for general acknowledgements
+    "OK":           {"type": "success", "text": "Command acknowledged/OK."}
 }
 ERROR_CODES: Set[str] = {k for k, v in MSG_CLASS.items() if v["type"] == "error"}
-# AFTER — remove "OK", keep it only as an informational ack
 TERMINAL_OK: Set[str] = {"DONE", "HOME_OK", "RESTART_OK"}
 
 # ========= AGV helpers =========
 def agv_url(path: str) -> str:
     base = AGV_BASE_URL.rstrip("/")
-    if not path.startswith("/"):
-        path = "/" + path
+    if not path.startswith("/"): path = "/" + path
     return f"{base}{path}"
 
 def http_get(url: str, timeout: float, req_id: str = "") -> requests.Response:
@@ -316,7 +182,6 @@ def send_task_to_agv(target: str, req_id: str = "") -> dict:
                 data = resp.json()
             except Exception:
                 data = {"error": resp.text}
-            # 同站點 → 視為成功（no-op），避免前端當成錯誤
             msg = (data.get("message") or data.get("error") or "")
             if resp.status_code == 400 and "current location is already the target tag number" in msg:
                 logging.warning(f"{req_id} [AGV] send-task noop: already at target ({target})")
@@ -335,94 +200,303 @@ def agv_pick_one(agvs: list, agv_id: int) -> Optional[dict]:
     return None
 
 def agv_is_busy(agv: dict) -> bool:
-    if not agv:
-        return True  # 沒資料就保守當成忙
-
+    if not agv: return True
     t = agv.get("task")
     working = bool(agv.get("working", False))
-
-    # 如果沒有任務，就單看 working
-    if not t:
-        return working
-
+    if not t: return working
     status = str(t.get("status", "")).upper()
-
-    # 任務完成/失敗/取消/空閒 → 都算不忙
-    if status in ("COMPLETED", "FAILED", "CANCELLED", "NONE", "IDLE", "WAITING"):
-        return False
-
-    # 其他情況（RUNNING, STARTING, 等等）都算忙
-    return True
-
+    return not (status in ("COMPLETED", "FAILED", "CANCELLED", "NONE", "IDLE", "WAITING"))
 
 def agv_task_status(agv: dict) -> Tuple[str, Optional[str]]:
     t = (agv or {}).get("task")
-    if not t:
-        return ("NONE", None)
+    if not t: return ("NONE", None)
     return (str(t.get("status", "NONE")).upper(), str(t.get("taskNumber")) if "taskNumber" in t else None)
 
-# ========= Track worker (background thread) =========
-def track_move_worker(y: int, req_id: str, deadline: float, idle_gap: float):
-    # only one track job at a time
-    if not _TRACK_LOCK.acquire(blocking=False): # Non-blocking acquire
-        log.warning(f"{req_id} [TRACK] Attempted to start move for y={y}, but track is already busy.")
-        return # Track is busy, exit worker early
+# ========= Track worker =========
+def make_command(head: str, *args: int) -> bytes:
+    head = head.strip().upper()
+    parts = [head] + [str(int(v)) for v in args]
+    return ",".join(parts).encode("ascii") + CR
 
-    try:
-        # Check for shutdown signal immediately
-        if _SHUTDOWN_EVENT.is_set():
-            log.info(f"{req_id} [TRACK] Shutdown event received, worker not starting.")
-            return
+def cm_to_units(cm: float) -> int:
+    return int(round(cm * 1000.0))  # cm→0.01mm
 
-        # map Y -> position
+def classify_messages(lines: List[str]) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    for raw in lines:
+        key = raw.strip()
+        meta = MSG_CLASS.get(key)
+        if meta is None:
+            out.append({"code": key, "type": "info", "text": key})
+        else:
+            out.append({"code": key, "type": meta["type"], "text": meta["text"]})
+    return out
+
+def read_messages_until(ser: serial.Serial, overall_deadline_s: float, idle_gap_s: Optional[float], req_id: str = "") -> Optional[List[str]]:
+    lines: List[str] = []
+    buf = bytearray()
+    start_time = time.monotonic()
+    last_rx_time = start_time
+    got_any_data = False
+    while True:
+        now = time.monotonic()
+        if _SHUTDOWN_EVENT.is_set(): log.info(f"{req_id} [TRACK] read: Shutdown."); return None
+        if (now - start_time) > overall_deadline_s:
+            log.warning(f"{req_id} [TRACK] read: deadline {overall_deadline_s:.1f}s exceeded."); break
+        if got_any_data and idle_gap_s is not None and (now - last_rx_time) > idle_gap_s:
+            log.info(f"{req_id} [TRACK] read: idle gap {idle_gap_s:.2f}s reached."); break
         try:
-            cm = CLICK_Y_STOPS_CM[y - 1]
-        except IndexError:
-            log.error(f"{req_id} [TRACK] invalid Y={y} (no mapping)")
-            return
+            b = ser.read(1)  # timeout=RS485_TIMEOUT
+        except serial.SerialTimeoutException:
+            if not got_any_data: log.debug(f"{req_id} [TRACK] read: initial no byte.")
+            continue
+        if b:
+            got_any_data = True
+            buf.extend(b)
+            last_rx_time = now
+            if b == CR:
+                line = bytes(buf[:-1]).decode("ascii", errors="replace").strip()
+                buf = bytearray()
+                if line:
+                    lines.append(line)
+                    log.info(f"{req_id} [TRACK] <- {line}")
+                    if line in TERMINAL_OK or line in ERROR_CODES:
+                        log.info(f"{req_id} [TRACK] read: Terminal '{line}'."); break
+    if not lines:
+        log.warning(f"{req_id} [TRACK] No complete lines."); return None
+    return lines
+
+def send_and_receive_multi(ser: serial.Serial, cmd_bytes: bytes, overall_deadline_s: float, idle_gap_s: Optional[float], req_id: str = "") -> Optional[List[str]]:
+    ser.reset_input_buffer(); ser.reset_output_buffer()
+    log.info(f"{req_id} [TRACK] -> {cmd_bytes!r}")
+    try:
+        ser.write(cmd_bytes); ser.flush()
+    except serial.SerialException as e:
+        log.error(f"{req_id} [TRACK] Write failed: {e}"); return None
+    if _SHUTDOWN_EVENT.is_set(): log.info(f"{req_id} [TRACK] Shutdown before delay."); return None
+    time.sleep(INTER_CMD_DELAY)
+    return read_messages_until(ser, overall_deadline_s=overall_deadline_s, idle_gap_s=idle_gap_s, req_id=req_id)
+
+def track_move_worker(y: int, req_id: str, deadline: float, idle_gap: float):
+    if not _TRACK_LOCK.acquire(blocking=False):
+        log.warning(f"{req_id} [TRACK] start denied: busy."); return
+    try:
+        if _SHUTDOWN_EVENT.is_set(): log.info(f"{req_id} [TRACK] shutdown."); return
+        try: cm = CLICK_Y_STOPS_CM[y - 1]
+        except IndexError: log.error(f"{req_id} [TRACK] invalid y={y}."); return
         pos_units = cm_to_units(cm)
         cmd = make_command("ABS", pos_units, CLICK_VEL, CLICK_ACC_MS, CLICK_DEC_MS)
-        log.info(f"{req_id} [TRACK] MOVE y={y} -> {cm} cm (pos={pos_units})")
-
-        # use the shared serial and guard I/O
-        try:
-            ser = serial_get_or_raise()
-        except serial.SerialException as e:
-            log.error(f"{req_id} [TRACK] serial unavailable: {e}")
-            return
-        except Exception as e:
-            log.error(f"{req_id} [TRACK] unexpected error getting serial: {e}")
-            return
-
+        log.info(f"{req_id} [TRACK] MOVE y={y} -> {cm} cm ({pos_units})")
+        try: ser = serial_get_or_raise()
+        except Exception as e: log.error(f"{req_id} [TRACK] serial unavailable: {e}"); return
         with SER_LOCK:
-            # Check shutdown event again before serial I/O
-            if _SHUTDOWN_EVENT.is_set():
-                log.info(f"{req_id} [TRACK] Shutdown event received before serial command, worker aborting.")
-                return
-
-            lines = send_and_receive_multi(ser, cmd,
-                                           overall_deadline_s=deadline,
-                                           idle_gap_s=idle_gap,
-                                           req_id=req_id)
+            if _SHUTDOWN_EVENT.is_set(): log.info(f"{req_id} [TRACK] shutdown before I/O."); return
+            lines = send_and_receive_multi(ser, cmd, overall_deadline_s=deadline, idle_gap_s=idle_gap, req_id=req_id)
         if lines is None:
-            # Check if shutdown caused the early exit
-            if _SHUTDOWN_EVENT.is_set():
-                log.info(f"{req_id} [TRACK] Worker terminated due to shutdown event during serial communication.")
-            else:
-                log.error(f"{req_id} [TRACK] no reply within {deadline:.1f}s (or before idle gap).")
+            if _SHUTDOWN_EVENT.is_set(): log.info(f"{req_id} [TRACK] terminated by shutdown.")
+            else: log.error(f"{req_id} [TRACK] no reply within {deadline:.1f}s.")
             return
-        
         parsed = classify_messages(lines)
         ok = all(p.get("type") != "error" for p in parsed)
         log.info(f"{req_id} [TRACK] parsed={parsed} ok={ok}")
-
-        if not ok:
-            log.error(f"{req_id} [TRACK] Track command failed, received error messages: {parsed}")
-
+        if not ok: log.error(f"{req_id} [TRACK] Track command failed: {parsed}")
     except Exception as e:
-        log.exception(f"{req_id} [TRACK] An unhandled error occurred in track_move_worker: {e}")
+        log.exception(f"{req_id} [TRACK] worker error: {e}")
     finally:
-        _TRACK_LOCK.release() # Ensure lock is always released
+        _TRACK_LOCK.release()
+
+# ========= Camera (Basler-only, bufferless) =========
+# 讀取 config.yaml 的 Camera 區塊
+import yaml
+try:
+    with open("config.yaml","r",encoding="utf-8") as f:
+        _CFG = yaml.safe_load(f) or {}
+    CAM_CFG = _CFG.get("Camera", {}) or {}
+except Exception as e:
+    log.warning(f"[CAM] load config.yaml failed: {e}")
+    CAM_CFG = {}
+
+# Basler bufferless 擷取：只保留最新一張
+_CAM_THREAD = None
+_CAM_LOCK = threading.Lock()
+_CAM_LAST = None           # 最新影格 (numpy.ndarray, BGR)
+_CAM_RUNNING = threading.Event()
+_CAM_OPENED = threading.Event()
+_CAM_ERR = None
+
+_CAM_START_LOCK = threading.Lock()   # 新增：避免並行啟動
+
+def _basler_loop():
+    """單一背景緒抓取；使用 GrabLoop_ProvidedByUser，避免內建緒 + 我們又 RetrieveResult 的競態。"""
+    global _CAM_LAST, _CAM_ERR
+    try:
+        import pypylon.pylon as pylon
+
+        camera = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
+        camera.Open()
+        try:
+            # 讀設定（和你現有的一樣）
+            width  = int(CAM_CFG.get("width", 1600))
+            height = int(CAM_CFG.get("height", 1200))
+            fps    = float(CAM_CFG.get("frame_rate", 60.0))
+            exp_us = int(CAM_CFG.get("exposure_time", 3000))
+            gain   = float(CAM_CFG.get("gain", 0.0))
+            revX   = bool(CAM_CFG.get("reverse_X", False))
+            revY   = bool(CAM_CFG.get("reverse_Y", False))
+
+            # 安全設置
+            # try:
+            #     if camera.Width.Max >= width: camera.Width.Value = width
+            #     if camera.Height.Max >= height: camera.Height.Value = height
+            # except Exception as e:
+            #     log.warning(f"[CAM] set WxH warn: {e}")
+
+            # try:
+            #     if camera.AcquisitionFrameRateEnable.IsWritable():
+            #         camera.AcquisitionFrameRateEnable.Value = True
+            #     if camera.AcquisitionFrameRate.IsWritable():
+            #         camera.AcquisitionFrameRate.Value = fps
+            # except Exception as e:
+            #     log.warning(f"[CAM] set FPS warn: {e}")
+
+            # try:
+            #     if camera.ExposureAuto.IsWritable():
+            #         camera.ExposureAuto.Value = "Off"
+            #     if camera.ExposureTime.IsWritable():
+            #         camera.ExposureTime.Value = exp_us
+            # except Exception as e:
+            #     log.warning(f"[CAM] set Exposure warn: {e}")
+
+            # try:
+            #     if camera.GainAuto.IsWritable():
+            #         camera.GainAuto.Value = "Off"
+            #     if camera.Gain.IsWritable():
+            #         camera.Gain.Value = gain
+            # except Exception as e:
+            #     log.warning(f"[CAM] set Gain warn: {e}")
+
+            # try:
+            #     if camera.ReverseX.IsWritable(): camera.ReverseX.Value = revX
+            #     if camera.ReverseY.IsWritable(): camera.ReverseY.Value = revY
+            # except Exception as e:
+            #     log.warning(f"[CAM] set Reverse warn: {e}")
+
+            # BGR8 轉換器
+            converter = pylon.ImageFormatConverter()
+            converter.OutputPixelFormat = pylon.PixelType_BGR8packed
+            converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
+
+            # ✅ 關鍵：讓「抓取緒 = 我們自己」；避免 InstantCamera 也開自己的抓取緒
+            camera.StartGrabbing(
+                pylon.GrabStrategy_LatestImageOnly,
+                pylon.GrabLoop_ProvidedByUser
+            )
+            log.info("[CAM] Basler camera started (LatestImageOnly, ProvidedByUser).")
+            _CAM_OPENED.set()
+
+            # bufferless：只保留最新一張；timeout 短一點避免阻塞收斂
+            while _CAM_RUNNING.is_set() and camera.IsGrabbing():
+                grab = camera.RetrieveResult(5, pylon.TimeoutHandling_Return)  # 5ms 輕量輪詢
+                if not grab:
+                    continue
+                if not grab.GrabSucceeded():
+                    grab.Release()
+                    continue
+                img = converter.Convert(grab).GetArray()  # BGR ndarray
+                grab.Release()
+
+                with _CAM_LOCK:
+                    _CAM_LAST = img
+
+        finally:
+            try:
+                if camera.IsGrabbing():
+                    camera.StopGrabbing()
+            except Exception:
+                pass
+            try:
+                camera.Close()
+            except Exception:
+                pass
+            log.info("[CAM] Basler camera closed.")
+    except Exception as e:
+        _CAM_ERR = e
+        log.error(f"[CAM] Basler loop error: {e}", exc_info=True)
+    finally:
+        _CAM_OPENED.clear()
+
+def camera_start():
+    """確保只啟動一個抓取緒；啟動時設置旗標，避免 /video.mjpg 多連線時重複啟動。"""
+    global _CAM_THREAD, _CAM_ERR
+    with _CAM_START_LOCK:
+        if _CAM_THREAD and _CAM_THREAD.is_alive():
+            return True
+        _CAM_ERR = None
+        _CAM_RUNNING.set()
+        _CAM_THREAD = threading.Thread(target=_basler_loop, name="BaslerLoop", daemon=True)
+        _CAM_THREAD.start()
+
+    # 等待開啟成功或錯誤
+    t0 = time.time()
+    while time.time() - t0 < 3.0:
+        if _CAM_OPENED.is_set():
+            log.info("[CAM] camera opened OK.")
+            return True
+        if _CAM_ERR is not None:
+            break
+        time.sleep(0.02)
+
+    # 啟動失敗處理
+    with _CAM_START_LOCK:
+        _CAM_RUNNING.clear()
+    if _CAM_ERR:
+        log.error(f"[CAM] failed to open camera: {_CAM_ERR}")
+    else:
+        log.error("[CAM] camera open timeout.")
+    return False
+
+def camera_close():
+    _CAM_RUNNING.clear()
+    t = None
+    if _CAM_THREAD and _CAM_THREAD.is_alive():
+        t = _CAM_THREAD
+    if t:
+        t.join(timeout=2.0)
+    log.info("[CAM] camera closed")
+
+def get_latest_jpeg(quality=80):
+    import cv2
+    with _CAM_LOCK:
+        img = None if _CAM_LAST is None else _CAM_LAST.copy()
+    if img is None:
+        return None
+    q = max(50, min(95, int(quality)))
+    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+    if not ok:
+        return None
+    return buf.tobytes()
+
+def mjpeg_generator(jpeg_quality=80):
+    # 斷線 / Ctrl-C 時要能收斂
+    try:
+        import itertools
+        for _ in itertools.count():
+            if _SHUTDOWN_EVENT.is_set(): break
+            b = get_latest_jpeg(jpeg_quality)
+            if b is None:
+                time.sleep(0.02)
+                continue
+            yield (b"--frame\r\n"
+                   b"Content-Type: image/jpeg\r\n"
+                   b"Cache-Control: no-cache\r\n"
+                   b"Pragma: no-cache\r\n"
+                   b"\r\n" + b + b"\r\n")
+            # 以最新影格為主，故不需 sleep；瀏覽器處理速度會自然節流
+    except GeneratorExit:
+        # 客戶端中止
+        pass
+    except Exception as e:
+        log.warning(f"[CAM] generator error: {e}")
 
 # ========= Routes =========
 @app.route("/")
@@ -434,7 +508,7 @@ def status():
     open_flag = bool(SER and getattr(SER, "is_open", False))
     return jsonify({"track_busy": track_busy(), "serial_open": open_flag, "port": RS485_PORT})
 
-# Optional: quick connectivity test
+# ---- AGV routes ----
 @app.get("/agv/test")
 def agv_test():
     base = request.args.get("base") or AGV_BASE_URL
@@ -448,7 +522,6 @@ def agv_test():
         log.error(f"{rid_} [AGV] TEST error: {e}")
         return jsonify({"ok": False, "error": str(e), "url": url}), 502
 
-# Optional proxy passthroughs
 @app.get("/agv/data")
 def api_agv_data():
     rid_ = rid()
@@ -462,69 +535,45 @@ def api_agv_data():
         log.error(f"{rid_} [AGV] data error: {e}")
         return jsonify({"ok": False, "error": f"agv data fetch failed: {e}"}), 502
 
-# Add this new route to your app.py, typically after your existing /agv/data route.
 @app.get("/agv/status-summary")
 def api_agv_status_summary():
     rid_ = rid()
-    busy_track = track_busy()   # default
+    busy_track = track_busy()
     busy_agv = False
     busy_combined = busy_track
-
     try:
         data = agv_fetch_all(req_id=rid_)
         agvs = data if isinstance(data, list) else data.get("data", [])
         agv = agv_pick_one(agvs, AGV_ID)
-
         if not agv:
             msg = f"AGV id={AGV_ID} not found"
             log.error(f"{rid_} [AGV] status-summary: {msg}")
             return jsonify({
-                "ok": False,
-                "agv_busy": True,         # be conservative on errors
-                "track_busy": busy_track,
-                "error": msg,
-                "agv_status_message": msg,
-                "agv_raw_status": {}
+                "ok": False, "agv_busy": True, "track_busy": busy_track,
+                "error": msg, "agv_status_message": msg, "agv_raw_status": {}
             }), 500
-
-        # ★ compute both, then OR
         busy_agv = agv_is_busy(agv)
         busy_combined = busy_agv or busy_track
-
         status_text, task_number = agv_task_status(agv)
         message = f"Status: {status_text}"
-        if task_number:
-            message += f", Task: {task_number}"
-        if busy_track:
-            message += " | Track: MOVING"
-
+        if task_number: message += f", Task: {task_number}"
+        if busy_track: message += " | Track: MOVING"
         return jsonify({
             "ok": True,
-            "agv_busy": busy_combined,     # ← front-end uses this
+            "agv_busy": busy_combined,
             "track_busy": busy_track,
             "agv_busy_raw": busy_agv,
             "agv_status_message": message,
             "agv_raw_status": agv
         })
-
     except requests.exceptions.RequestException as e:
         log.error(f"{rid_} [AGV] status-summary: HTTP request failed: {e}")
-        return jsonify({
-            "ok": False,
-            "agv_busy": True,
-            "track_busy": busy_track,
-            "error": str(e),
-            "agv_status_message": "Failed to connect to AGV system."
-        }), 502
+        return jsonify({"ok": False, "agv_busy": True, "track_busy": busy_track,
+                        "error": str(e), "agv_status_message": "Failed to connect to AGV system."}), 502
     except Exception as e:
         log.error(f"{rid_} [AGV] status-summary: Unexpected error: {e}")
-        return jsonify({
-            "ok": False,
-            "agv_busy": True,
-            "track_busy": busy_track,
-            "error": str(e),
-            "agv_status_message": "Server error checking AGV status."
-        }), 500
+        return jsonify({"ok": False, "agv_busy": True, "track_busy": busy_track,
+                        "error": str(e), "agv_status_message": "Server error checking AGV status."}), 500
 
 @app.post("/agv/send-task")
 def api_agv_send_task():
@@ -550,27 +599,15 @@ def api_agv_home():
         log.error(f"{rid_} [AGV] home error: {e}")
         return jsonify({"ok": False, "error": f"home failed: {e}"}), 502
 
-
-# ---- Main /click: AGV (sync) first, then Track (async worker) ----
 @app.post("/click")
 def click():
-    """
-    From 3D UI: {x:1..7, y:1..10}
-    Flow:
-      1) AGV: check status -> send-task (wait HTTP reply) -> stop (no polling)
-      2) Track: if not busy, start background thread to perform ABS move
-      3) Return immediately with agv_result + track_job_started/busy
-    """
     rid_ = rid()
     payload = request.get_json(force=True) or {}
     x = int(payload.get("x", 0))
     y = int(payload.get("y", 0))
     log.info(f"{rid_} [/click] recv x={x}, y={y} from {request.remote_addr}")
-
     if not (1 <= y <= 10):
         return jsonify({"ok": False, "error": f"invalid y={y} (expected 1..10)"}), 400
-
-    # ---- (1) AGV: check & send once (sync) ----
     agv_result = {"ok": False, "skipped": False, "base": AGV_BASE_URL}
     try:
         data = agv_fetch_all(req_id=rid_)
@@ -587,86 +624,78 @@ def click():
             if busy_now:
                 agv_result = {"ok": False, "busy": True, "error": f"AGV {AGV_ID} busy (status={st0}, taskNumber={tn0})", "base": AGV_BASE_URL}
             else:
-                target_key = str(min(max(x, 1), 7)) # Ensure x is within 1-7 range for target mapping
+                target_key = str(min(max(x, 1), 7))
                 target = AGV_TARGETS.get(target_key)
                 if not target:
                     msg = f"no target mapped for x={x} (mapped to {target_key})"
                     log.error(f"{rid_} [AGV] {msg}")
                     agv_result = {"ok": False, "error": msg, "base": AGV_BASE_URL}
                 else:
-                    try:
-                        st_resp = send_task_to_agv(target, req_id=rid_)
-                        task_number = st_resp.get("taskNumber") if isinstance(st_resp, dict) else None
-                        agv_result = {"ok": True, "target": target, "taskNumber": task_number, "base": AGV_BASE_URL}
-                        log.info(f"{rid_} [AGV] send-task OK target={target} taskNumber={task_number}")
-                    except Exception as e:
-                        log.error(f"{rid_} [AGV] send-task failed: {e}")
-                        agv_result = {"ok": False, "error": f"send-task failed: {e}", "base": AGV_BASE_URL}
+                    st_resp = send_task_to_agv(target, req_id=rid_)
+                    agv_result = {"ok": True, **(st_resp if isinstance(st_resp, dict) else {})}
     except Exception as e:
-        log.error(f"{rid_} [AGV] fetch data failed: {e}")
-        agv_result = {"ok": False, "error": f"fetch agv data failed: {e}", "base": AGV_BASE_URL}
-
-    # ---- (2) Track: start async worker if not busy ----
-    track_started = False
-    if _SHUTDOWN_EVENT.is_set(): # Don't start new workers if shutting down
-        log.info(f"{rid_} [TRACK] application is shutting down, skipping new move.")
-    elif track_busy():
-        log.info(f"{rid_} [TRACK] busy: skip starting new move")
-    else:
-        deadline = float(payload.get("read_deadline_s", READ_DEADLINE_DEFAULT))
-        idle_gap = float(payload.get("idle_gap_s", IDLE_GAP_DEFAULT))
-        t = threading.Thread(target=track_move_worker, args=(y, rid_, deadline, idle_gap), daemon=True)
-        t.start()
+        log.error(f"{rid_} [AGV] send error: {e}")
+        agv_result = {"ok": False, "error": str(e), "base": AGV_BASE_URL}
+    deadline = READ_DEADLINE_DEFAULT
+    idle_gap = IDLE_GAP_DEFAULT
+    if not track_busy():
+        th = threading.Thread(target=track_move_worker, args=(y, rid(), deadline, idle_gap), daemon=True)
+        th.start()
         track_started = True
-        log.info(f"{rid_} [TRACK] worker started for y={y}")
-
-    # ---- (3) Return immediately ----
+    else:
+        track_started = False
     return jsonify({
-        "ok": agv_result.get("ok", False) and track_started, # 'ok' is true if both AGV task sent AND track job started
+        "ok": bool(agv_result.get("ok")),
         "x": x, "y": y,
         "agv_result": agv_result,
-        "track_job_started": track_started,
-        "track_busy": track_busy(),
-        "serial_open": bool(SER and getattr(SER, "is_open", False))
+        "track_job_started": track_started
     })
 
-# ========= Startup / Shutdown hooks =========
-atexit.register(serial_close)
+# ---- MJPEG streaming route ----
+@app.get("/video.mjpg")
+def video_mjpg():
+    # 啟動相機擷取緒（只在需要時）
+    if not _CAM_RUNNING.is_set():
+        ok = camera_start()
+        if not ok:
+            return jsonify({"ok": False, "error": f"camera open failed: {_CAM_ERR}"}), 503
+    return Response(mjpeg_generator(80),
+                    mimetype="multipart/x-mixed-replace; boundary=frame",
+                    headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+
+# ========= Startup / Shutdown =========
+def _cleanup_all():
+    try:
+        camera_close()
+    except Exception:
+        pass
+    try:
+        serial_close()
+    except Exception:
+        pass
+
+@atexit.register
+def _atexit_cleanup():
+    _cleanup_all()
 
 def _sig_handler(signum, frame):
     log.info(f"[SIGNAL] received {signum}, initiating graceful shutdown...")
-    # Signal all worker threads to stop
     _SHUTDOWN_EVENT.set()
-    # Close serial port (also called by atexit)
-    serial_close()
-    
-    # Give a short moment for cleanup, especially if there are other threads.
-    # In a real production environment with Gunicorn, Gunicorn would manage worker processes.
-    time.sleep(1) 
-    
-    # Use os._exit() for a forceful exit to ensure termination,
-    # as sys.exit() can be caught by Flask's development server.
-    log.info(f"[SIGNAL] Forcefully exiting process.")
-    os._exit(0)
+    _cleanup_all()
+    # 讓 Flask dev server 結束：拋 KeyboardInterrupt
+    raise KeyboardInterrupt()
 
 for _sig in (signal.SIGINT, signal.SIGTERM):
     try:
         signal.signal(_sig, _sig_handler)
     except Exception as e:
-        # in some hosted envs signal handling is restricted
-        log.warning(f"[SIGNAL] Could not register signal handler for {_sig}: {e}")
-        pass
+        log.warning(f"[SIGNAL] Could not register handler for {_sig}: {e}")
 
-# ========= App entry =========
 if __name__ == "__main__":
     try:
-        # Initialize serial port when the script starts
-        serial_init() 
+        serial_init()
     except Exception as e:
         log.error(f"[BOOT] Initial serial port setup failed: {e}")
-        # Decide here if you want to exit or let the app run without serial
-        # For now, we let it run, and serial_get_or_raise will attempt re-init
-    
     log.info("[BOOT] Starting Flask application...")
-    # Make sure use_reloader is False to avoid multiple processes and cleaner shutdown
-    app.run(host="0.0.0.0", port=8000, debug=True, use_reloader=False) 
+    # threaded=True 讓 MJPEG generator 不會阻塞
+    app.run(host="0.0.0.0", port=8000, debug=False, use_reloader=False, threaded=True)

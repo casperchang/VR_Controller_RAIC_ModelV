@@ -1,0 +1,74 @@
+Pacman:
+    rack_id: 2
+    track_id: 3
+
+Server:
+    server_ip: "http://114.34.174.244"
+    server_port: "8009"
+    internal_ip: "http://192.168.0.192"
+    internal_port: "8009"
+    api_base_url: "http://114.34.174.244:8009/api"
+
+Camera:
+    camera_type: "Basler"
+    reverse_X: false
+    reverse_Y: false
+    exposure_time: 3000
+    frame_rate: 60.0
+    width: 1600
+    height: 1200
+    gain: 0.0
+
+Motor:
+    fixed_or_moving: "moving"
+    baudrate: 9600
+
+Model:
+  boot_mode: "default"
+
+  # 共同參數（可被各模式覆寫）
+  _common: &common
+    device: ""
+    dnn: false
+    half: false
+    imgsz: [640, 640]
+    conf_thres: 0.75
+    iou_thres: 0.45
+    classes: null
+    agnostic_nms: false
+    max_det: 1000
+    augment: false
+    visualize: false
+    seed : 920
+    show_video : false
+    show_frame_rate : true
+    nosave : false
+    frame_skip : 0
+    save_capture : false
+    save_box : true
+    save_csv : false
+    save_txt : false
+
+  default:
+    <<: *common
+    weights: "/home/user/src/RAIC_v1.0/app/model/mouse_and_feed_class_v1.7.engine"
+    data: "/home/user/src/RAIC_v1.0/app/data/mouse_and_feed_class.yaml"
+    conf_thres: 0.75   # 覆寫共同參數
+
+  feed_amount:
+    <<: *common
+    weights: "/home/user/src/RAIC_v1.0/app_dev/model/feed_amount_v1.0.engine"
+    data: "/home/user/src/RAIC_v1.0/app_dev/data/mouse_and_feed_all_classes.yaml"
+    conf_thres: 0.75   # 覆寫共同參數
+
+  water_leak:
+    <<: *common
+    weights: "/home/user/src/RAIC_v1.0/app_dev/model/water_leak_v1.0.engine"
+    data: "/home/user/src/RAIC_v1.0/app_dev/data/mouse_and_feed_all_classes.yaml"
+    conf_thres: 0.50   # 覆寫共同參數
+
+  death_detection:
+    <<: *common
+    weights: "/home/user/src/RAIC_v1.0/app_dev/model/death_v1.0.engine"
+    data: "/home/user/src/RAIC_v1.0/app_dev/data/mouse_and_feed_all_classes.yaml"
+    conf_thres: 0.50   # 覆寫共同參數

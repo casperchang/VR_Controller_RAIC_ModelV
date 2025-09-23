@@ -5,12 +5,12 @@ import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/cont
 /* ==========
    Parameters
    ========== */
-const CUBE_SIZE = 1;                 // 1 unit = 1 cm
-const COLS = 6;                      // x: 1..6
-const ROWS = 10;                     // y: 1..10
-const FRONT_NORMAL = new THREE.Vector3(0, 0, 1);  // +Z front
-const RIGHT_NORMAL = new THREE.Vector3(1, 0, 0);  // +X right
-const ANG_TOL = 0.9;                 // cosθ threshold for face picking
+const CUBE_SIZE = 1;
+const COLS = 6;
+const ROWS = 10;
+const FRONT_NORMAL = new THREE.Vector3(0, 0, 1);
+const RIGHT_NORMAL = new THREE.Vector3(1, 0, 0);
+const ANG_TOL = 0.9;
 const BLUE = 0x3b82f6;
 
 const INITIAL_VIEW = {
@@ -45,7 +45,7 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 document.body.appendChild(renderer.domElement);
 
-// Controls: L-rotate, R-pan, wheel-zoom
+// Controls
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.mouseButtons = {
@@ -64,7 +64,7 @@ const dir = new THREE.DirectionalLight(0xffffff, 0.4);
 dir.position.set(3,5,6);
 scene.add(dir);
 
-// Grid (optional)
+// Grid
 const grid = new THREE.GridHelper(40, 40, 0x334155, 0x1f2937);
 grid.position.y = -0.51;
 scene.add(grid);
@@ -83,7 +83,6 @@ function ensureDom(elId, tag, styles = {}) {
   return el;
 }
 
-// Left-top status (existing). If your HTML already has #status, we reuse it.
 const statusEl = ensureDom('status', 'div', {
   position: 'fixed',
   top: '80px',
@@ -101,7 +100,6 @@ const statusEl = ensureDom('status', 'div', {
   whiteSpace: 'pre-wrap'
 });
 
-// Top-right buttons container
 const uiBox = ensureDom('ui-box', 'div', {
   position: 'fixed',
   top: '10px',
@@ -113,7 +111,6 @@ const uiBox = ensureDom('ui-box', 'div', {
   alignItems: 'flex-end'
 });
 
-// Simple button factory
 function mkBtn(text) {
   const b = document.createElement('button');
   b.textContent = text;
@@ -134,14 +131,12 @@ function mkBtn(text) {
 
 const btnHome  = mkBtn('AGV HOME');
 const btnStat  = mkBtn('AGV STATUS');
-
 uiBox.appendChild(btnHome);
 uiBox.appendChild(btnStat);
 
-// Right-top plain text panel (directly below AGV STATUS button)
 const statPanel = ensureDom('agv-status-panel', 'pre', {
   position: 'fixed',
-  top: '90px',            // 10px + button heights (~48px) + gap
+  top: '90px',
   right: '10px',
   zIndex: 1000,
   color: '#e5e7eb',
@@ -158,17 +153,16 @@ const statPanel = ensureDom('agv-status-panel', 'pre', {
   margin: 0,
   whiteSpace: 'pre-wrap'
 });
-statPanel.textContent = ''; // hidden if empty
+statPanel.textContent = '';
 statPanel.style.display = 'none';
 
 /* ==========================
    Geometries / Hover helpers
    ========================== */
-const boxGeom = new THREE.BoxGeometry(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE);
+const CUBE = new THREE.BoxGeometry(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE);
 const invisibleMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.0 });
 const edgeMat = new THREE.LineBasicMaterial({ color: BLUE });
 
-// Hover plane
 const hoverPlane = new THREE.Mesh(
   new THREE.PlaneGeometry(CUBE_SIZE, CUBE_SIZE),
   new THREE.MeshBasicMaterial({ color: 0xff2d2e, transparent: true, opacity: 0.6, side: THREE.DoubleSide, depthTest:false, depthWrite:false })
@@ -177,7 +171,6 @@ hoverPlane.renderOrder = 998;
 hoverPlane.visible = false;
 scene.add(hoverPlane);
 
-// Build 6x10 cubes (hidden solids for raycast + visible edges)
 function xPosFromIndex(ix) { return (ix - (COLS + 1) / 2) * CUBE_SIZE; }
 function yPosFromIndex(iy) { return (iy - 0.5) * CUBE_SIZE; }
 const zPos = 0;
@@ -185,13 +178,13 @@ const zPos = 0;
 const pickMeshes = [];
 for (let ix = 1; ix <= COLS; ix++) {
   for (let iy = 1; iy <= ROWS; iy++) {
-    const mesh = new THREE.Mesh(boxGeom, invisibleMat);
+    const mesh = new THREE.Mesh(CUBE, invisibleMat);
     mesh.position.set(xPosFromIndex(ix), yPosFromIndex(iy), zPos);
     mesh.userData = { x: ix, y: iy };
     scene.add(mesh);
     pickMeshes.push(mesh);
 
-    const edges = new THREE.EdgesGeometry(boxGeom, 1);
+    const edges = new THREE.EdgesGeometry(CUBE, 1);
     const line = new THREE.LineSegments(edges, edgeMat);
     line.position.copy(mesh.position);
     scene.add(line);
@@ -225,7 +218,6 @@ async function pollAgvStatus() {
   try {
     const resp = await fetch("/agv/status-summary");
     const data = await resp.json();
-
     if (resp.ok && data.agv_busy !== undefined) {
       if (!data.agv_busy) {
         updateAgvBusyStatus(false, "AGV 就緒", data.agv_raw_status);
@@ -233,8 +225,6 @@ async function pollAgvStatus() {
         return;
       }
       updateAgvBusyStatus(data.agv_busy, data.agv_status_message, data.agv_raw_status);
-
-      // task tracking end conditions
       if (currentAgvTaskNumber && data.agv_raw_status?.task?.taskNumber === currentAgvTaskNumber) {
         const taskStatus = data.agv_raw_status.task.status;
         if (taskStatus === "COMPLETED" || taskStatus === "FAILED" || taskStatus === "CANCELLED") {
@@ -280,12 +270,10 @@ function renderRightTopStatus(objOrString, isError = false) {
   }
   statPanel.style.borderColor = isError ? 'rgba(252,165,165,.6)' : 'rgba(59,130,246,.25)';
 }
-
 function clearRightTopStatus() {
   statPanel.textContent = '';
   statPanel.style.display = 'none';
 }
-
 function sendClick(x, y) {
   if (isAgvBusy) {
     console.log("AGV busy; blocked new command.");
@@ -293,7 +281,6 @@ function sendClick(x, y) {
   }
   statusEl.textContent = `送出：x=${x}, y=${y} ...`;
   updateAgvBusyStatus(true, "送出中...");
-
   fetch("/click", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -303,27 +290,23 @@ function sendClick(x, y) {
     let d;
     try { d = await resp.json(); }
     catch (e) { throw new Error(`Invalid JSON response: ${e}`); }
-
     if (d.agv_result?.busy) {
       updateAgvBusyStatus(true, d.agv_result.error || `AGV 忙碌, 狀態: ${d.agv_result.status}`);
       stopPollingAgvStatus();
       return;
     }
-
     if (!d.ok) {
       statusEl.innerHTML = `<span class="err" style="color:#fca5a5">Error: ${d.error || d.agv_result?.error || 'unknown'}</span>`;
       updateAgvBusyStatus(true, d.error || d.agv_result?.error || 'unknown');
       stopPollingAgvStatus();
       return;
     }
-
     if (d.agv_result?.noop) {
       statusEl.innerHTML = `狀態：<span class="ok" style="color:#86efac">AGV 已在目標點（${d.agv_result.target}）</span>；確認軌道...`;
       updateAgvBusyStatus(true, "AGV no-op，等待軌道完成...");
       startPollingAgvStatus(null);
       return;
     }
-
     statusEl.innerHTML = `狀態：<span class="ok" style="color:#86efac">OK</span> （伺服器回覆 x=${d.x}, y=${d.y}）`;
     updateAgvBusyStatus(true, "AGV 任務已送出，等待完成...");
     startPollingAgvStatus(d.agv_result ? d.agv_result.taskNumber : null);
@@ -344,7 +327,6 @@ function setPointerFromEvent(event) {
   const py = (event.clientY - rect.top) / rect.height;
   pointer.set(px * 2 - 1, -(py * 2 - 1));
 }
-
 const EPS = 0.002;
 function showHoverFace(mesh, faceType) {
   if (isAgvBusy) return;
@@ -367,7 +349,6 @@ function onMouseMove(event) {
   if (isAgvBusy) { hideHover(); return; }
   setPointerFromEvent(event);
   raycaster.setFromCamera(pointer, camera);
-
   const hits = raycaster.intersectObjects(pickMeshes, false);
   if (!hits.length) { hideHover(); return; }
   const hit = hits[0];
@@ -378,13 +359,10 @@ function onMouseMove(event) {
   if (x === COLS && worldNormal.dot(RIGHT_NORMAL) > ANG_TOL) { showHoverFace(mesh, 'right'); return; }
   hideHover();
 }
-
 function onClick(event) {
   if (isAgvBusy) { console.log("AGV busy; click ignored."); return; }
   setPointerFromEvent(event);
   raycaster.setFromCamera(pointer, camera);
-
-  // Only scene picking (UI is DOM, so no 3D UI checks needed)
   const hits = raycaster.intersectObjects(pickMeshes, false);
   if (!hits.length) return;
   const hit = hits[0];
@@ -394,13 +372,13 @@ function onClick(event) {
   if (worldNormal.dot(FRONT_NORMAL) > ANG_TOL) { sendClick(x, y); return; }
   if (x === COLS && worldNormal.dot(RIGHT_NORMAL) > ANG_TOL) { sendClick(7, y); return; }
 }
-
 renderer.domElement.addEventListener('mousemove', onMouseMove);
 renderer.domElement.addEventListener('click', onClick);
 
 /* ====================
    DOM button handlers
    ==================== */
+
 btnHome.addEventListener('click', () => {
   if (isAgvBusy) return;
   clearRightTopStatus();
@@ -426,14 +404,8 @@ btnHome.addEventListener('click', () => {
       stopPollingAgvStatus();
       return;
     }
-    if (d.noop || (d.message && String(d.message).includes('already the target'))) {
-      statusEl.innerHTML = `狀態：<span class="ok" style="color:#86efac">AGV 已在 HOME (1001)</span>；確認軌道...`;
-      updateAgvBusyStatus(true, "AGV no-op；等待軌道完成...");
-      startPollingAgvStatus(null);
-      return;
-    }
-    statusEl.innerHTML = `狀態：<span class="ok" style="color:#86efac">AGV HOME 已送出</span>`;
-    updateAgvBusyStatus(true, "AGV HOME 已啟動，等待完成...");
+    statusEl.innerHTML = `狀態：<span class="ok" style="color:#86efac">已送出 HOME</span>，等待完成...`;
+    updateAgvBusyStatus(true, "AGV 任務已送出，等待完成...");
     startPollingAgvStatus(d.taskNumber || null);
   })
   .catch(err => {
@@ -443,45 +415,28 @@ btnHome.addEventListener('click', () => {
   });
 });
 
-btnStat.addEventListener('click', () => {
-  fetch('/agv/status-summary')
-    .then(r => r.json().then(d => ({ok:r.ok, d})))
-    .then(({ok, d}) => {
-      renderRightTopStatus(d, !ok);
-    })
-    .catch(err => {
-      renderRightTopStatus(String(err), true);
-    });
+btnStat.addEventListener('click', async () => {
+  try {
+    const r = await fetch('/agv/status-summary');
+    const d = await r.json();
+    renderRightTopStatus(d, !r.ok || d.ok === false);
+  } catch (e) {
+    renderRightTopStatus(String(e), true);
+  }
 });
 
-/* =========
-   Animate
-   ========= */
-function animate() {
+/* =============
+   Render loop
+   ============= */
+function loop(){
   controls.update();
   renderer.render(scene, camera);
-  requestAnimationFrame(animate);
+  requestAnimationFrame(loop);
 }
-animate();
+loop();
 
-/* =========
-   Resize
-   ========= */
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
-  // DOM UI auto-follows via fixed positioning; nothing else to do
 });
-
-/* ==========================
-   Initial one-shot status check
-   ========================== */
-window.onload = () => {
-  console.log("Initial AGV status check on page load.");
-  pollAgvStatus();
-  // Initial hint
-  if (!statusEl.textContent.trim()) {
-    statusEl.textContent = 'AGV 狀態讀取中...';
-  }
-};
