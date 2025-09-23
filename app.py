@@ -305,7 +305,7 @@ def track_move_worker(y: int, req_id: str, deadline: float, idle_gap: float):
     finally:
         _TRACK_LOCK.release()
 
-# ========= Camera (Basler-only, bufferless) =========
+# ========= Camera (Basler-only, bufferless) - UNCHANGED =========
 # 讀取 config.yaml 的 Camera 區塊
 import yaml
 try:
@@ -316,108 +316,45 @@ except Exception as e:
     log.warning(f"[CAM] load config.yaml failed: {e}")
     CAM_CFG = {}
 
-# Basler bufferless 擷取：只保留最新一張
 _CAM_THREAD = None
 _CAM_LOCK = threading.Lock()
-_CAM_LAST = None           # 最新影格 (numpy.ndarray, BGR)
+_CAM_LAST = None
 _CAM_RUNNING = threading.Event()
 _CAM_OPENED = threading.Event()
 _CAM_ERR = None
-
-_CAM_START_LOCK = threading.Lock()   # 新增：避免並行啟動
+_CAM_START_LOCK = threading.Lock()
 
 def _basler_loop():
-    """單一背景緒抓取；使用 GrabLoop_ProvidedByUser，避免內建緒 + 我們又 RetrieveResult 的競態。"""
     global _CAM_LAST, _CAM_ERR
     try:
         import pypylon.pylon as pylon
-
         camera = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
         camera.Open()
         try:
-            # 讀設定（和你現有的一樣）
-            width  = int(CAM_CFG.get("width", 1600))
-            height = int(CAM_CFG.get("height", 1200))
-            fps    = float(CAM_CFG.get("frame_rate", 60.0))
-            exp_us = int(CAM_CFG.get("exposure_time", 3000))
-            gain   = float(CAM_CFG.get("gain", 0.0))
-            revX   = bool(CAM_CFG.get("reverse_X", False))
-            revY   = bool(CAM_CFG.get("reverse_Y", False))
-
-            # 安全設置
-            # try:
-            #     if camera.Width.Max >= width: camera.Width.Value = width
-            #     if camera.Height.Max >= height: camera.Height.Value = height
-            # except Exception as e:
-            #     log.warning(f"[CAM] set WxH warn: {e}")
-
-            # try:
-            #     if camera.AcquisitionFrameRateEnable.IsWritable():
-            #         camera.AcquisitionFrameRateEnable.Value = True
-            #     if camera.AcquisitionFrameRate.IsWritable():
-            #         camera.AcquisitionFrameRate.Value = fps
-            # except Exception as e:
-            #     log.warning(f"[CAM] set FPS warn: {e}")
-
-            # try:
-            #     if camera.ExposureAuto.IsWritable():
-            #         camera.ExposureAuto.Value = "Off"
-            #     if camera.ExposureTime.IsWritable():
-            #         camera.ExposureTime.Value = exp_us
-            # except Exception as e:
-            #     log.warning(f"[CAM] set Exposure warn: {e}")
-
-            # try:
-            #     if camera.GainAuto.IsWritable():
-            #         camera.GainAuto.Value = "Off"
-            #     if camera.Gain.IsWritable():
-            #         camera.Gain.Value = gain
-            # except Exception as e:
-            #     log.warning(f"[CAM] set Gain warn: {e}")
-
-            # try:
-            #     if camera.ReverseX.IsWritable(): camera.ReverseX.Value = revX
-            #     if camera.ReverseY.IsWritable(): camera.ReverseY.Value = revY
-            # except Exception as e:
-            #     log.warning(f"[CAM] set Reverse warn: {e}")
-
-            # BGR8 轉換器
             converter = pylon.ImageFormatConverter()
             converter.OutputPixelFormat = pylon.PixelType_BGR8packed
             converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
-
-            # ✅ 關鍵：讓「抓取緒 = 我們自己」；避免 InstantCamera 也開自己的抓取緒
             camera.StartGrabbing(
                 pylon.GrabStrategy_LatestImageOnly,
                 pylon.GrabLoop_ProvidedByUser
             )
             log.info("[CAM] Basler camera started (LatestImageOnly, ProvidedByUser).")
             _CAM_OPENED.set()
-
-            # bufferless：只保留最新一張；timeout 短一點避免阻塞收斂
             while _CAM_RUNNING.is_set() and camera.IsGrabbing():
-                grab = camera.RetrieveResult(5, pylon.TimeoutHandling_Return)  # 5ms 輕量輪詢
-                if not grab:
-                    continue
+                grab = camera.RetrieveResult(5, pylon.TimeoutHandling_Return)
+                if not grab: continue
                 if not grab.GrabSucceeded():
                     grab.Release()
                     continue
-                img = converter.Convert(grab).GetArray()  # BGR ndarray
+                img = converter.Convert(grab).GetArray()
                 grab.Release()
-
-                with _CAM_LOCK:
-                    _CAM_LAST = img
-
+                with _CAM_LOCK: _CAM_LAST = img
         finally:
             try:
-                if camera.IsGrabbing():
-                    camera.StopGrabbing()
-            except Exception:
-                pass
-            try:
-                camera.Close()
-            except Exception:
-                pass
+                if camera.IsGrabbing(): camera.StopGrabbing()
+            except Exception: pass
+            try: camera.Close()
+            except Exception: pass
             log.info("[CAM] Basler camera closed.")
     except Exception as e:
         _CAM_ERR = e
@@ -426,58 +363,43 @@ def _basler_loop():
         _CAM_OPENED.clear()
 
 def camera_start():
-    """確保只啟動一個抓取緒；啟動時設置旗標，避免 /video.mjpg 多連線時重複啟動。"""
     global _CAM_THREAD, _CAM_ERR
     with _CAM_START_LOCK:
-        if _CAM_THREAD and _CAM_THREAD.is_alive():
-            return True
+        if _CAM_THREAD and _CAM_THREAD.is_alive(): return True
         _CAM_ERR = None
         _CAM_RUNNING.set()
         _CAM_THREAD = threading.Thread(target=_basler_loop, name="BaslerLoop", daemon=True)
         _CAM_THREAD.start()
-
-    # 等待開啟成功或錯誤
     t0 = time.time()
     while time.time() - t0 < 3.0:
         if _CAM_OPENED.is_set():
             log.info("[CAM] camera opened OK.")
             return True
-        if _CAM_ERR is not None:
-            break
+        if _CAM_ERR is not None: break
         time.sleep(0.02)
-
-    # 啟動失敗處理
-    with _CAM_START_LOCK:
-        _CAM_RUNNING.clear()
-    if _CAM_ERR:
-        log.error(f"[CAM] failed to open camera: {_CAM_ERR}")
-    else:
-        log.error("[CAM] camera open timeout.")
+    with _CAM_START_LOCK: _CAM_RUNNING.clear()
+    if _CAM_ERR: log.error(f"[CAM] failed to open camera: {_CAM_ERR}")
+    else: log.error("[CAM] camera open timeout.")
     return False
 
 def camera_close():
     _CAM_RUNNING.clear()
     t = None
-    if _CAM_THREAD and _CAM_THREAD.is_alive():
-        t = _CAM_THREAD
-    if t:
-        t.join(timeout=2.0)
+    if _CAM_THREAD and _CAM_THREAD.is_alive(): t = _CAM_THREAD
+    if t: t.join(timeout=2.0)
     log.info("[CAM] camera closed")
 
 def get_latest_jpeg(quality=80):
     import cv2
     with _CAM_LOCK:
         img = None if _CAM_LAST is None else _CAM_LAST.copy()
-    if img is None:
-        return None
+    if img is None: return None
     q = max(50, min(95, int(quality)))
     ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), q])
-    if not ok:
-        return None
+    if not ok: return None
     return buf.tobytes()
 
 def mjpeg_generator(jpeg_quality=80):
-    # 斷線 / Ctrl-C 時要能收斂
     try:
         import itertools
         for _ in itertools.count():
@@ -491,12 +413,8 @@ def mjpeg_generator(jpeg_quality=80):
                    b"Cache-Control: no-cache\r\n"
                    b"Pragma: no-cache\r\n"
                    b"\r\n" + b + b"\r\n")
-            # 以最新影格為主，故不需 sleep；瀏覽器處理速度會自然節流
-    except GeneratorExit:
-        # 客戶端中止
-        pass
-    except Exception as e:
-        log.warning(f"[CAM] generator error: {e}")
+    except GeneratorExit: pass
+    except Exception as e: log.warning(f"[CAM] generator error: {e}")
 
 # ========= Routes =========
 @app.route("/")
@@ -538,42 +456,72 @@ def api_agv_data():
 @app.get("/agv/status-summary")
 def api_agv_status_summary():
     rid_ = rid()
-    busy_track = track_busy()
-    busy_agv = False
-    busy_combined = busy_track
+    is_track_busy = track_busy()
+    is_agv_busy = False
+    
     try:
         data = agv_fetch_all(req_id=rid_)
         agvs = data if isinstance(data, list) else data.get("data", [])
         agv = agv_pick_one(agvs, AGV_ID)
+
         if not agv:
             msg = f"AGV id={AGV_ID} not found"
             log.error(f"{rid_} [AGV] status-summary: {msg}")
             return jsonify({
-                "ok": False, "agv_busy": True, "track_busy": busy_track,
-                "error": msg, "agv_status_message": msg, "agv_raw_status": {}
+                "ok": False,
+                "system_busy": True,  # Assume busy if AGV is not found
+                "details": {
+                    "track_busy": is_track_busy,
+                    "agv_busy": True,
+                    "message": msg,
+                },
+                "error": msg,
+                "agv_raw_status": {}
             }), 500
-        busy_agv = agv_is_busy(agv)
-        busy_combined = busy_agv or busy_track
+
+        is_agv_busy = agv_is_busy(agv)
+        system_is_busy = is_agv_busy or is_track_busy
         status_text, task_number = agv_task_status(agv)
-        message = f"Status: {status_text}"
-        if task_number: message += f", Task: {task_number}"
-        if busy_track: message += " | Track: MOVING"
+
+        agv_msg_part = f"AGV: {status_text}"
+        if task_number: agv_msg_part += f" (Task: {task_number})"
+        track_msg_part = "Track: MOVING" if is_track_busy else "Track: Idle"
+        combined_message = f"{agv_msg_part} | {track_msg_part}"
+
         return jsonify({
             "ok": True,
-            "agv_busy": busy_combined,
-            "track_busy": busy_track,
-            "agv_busy_raw": busy_agv,
-            "agv_status_message": message,
+            "system_busy": system_is_busy,
+            "details": {
+                "track_busy": is_track_busy,
+                "agv_busy": is_agv_busy,
+                "message": combined_message,
+            },
             "agv_raw_status": agv
         })
     except requests.exceptions.RequestException as e:
         log.error(f"{rid_} [AGV] status-summary: HTTP request failed: {e}")
-        return jsonify({"ok": False, "agv_busy": True, "track_busy": busy_track,
-                        "error": str(e), "agv_status_message": "Failed to connect to AGV system."}), 502
+        return jsonify({
+            "ok": False,
+            "system_busy": True, # Assume busy on comms error
+            "details": {
+                "track_busy": is_track_busy,
+                "agv_busy": True,
+                "message": "Failed to connect to AGV system."
+            },
+            "error": str(e),
+        }), 502
     except Exception as e:
         log.error(f"{rid_} [AGV] status-summary: Unexpected error: {e}")
-        return jsonify({"ok": False, "agv_busy": True, "track_busy": busy_track,
-                        "error": str(e), "agv_status_message": "Server error checking AGV status."}), 500
+        return jsonify({
+            "ok": False,
+            "system_busy": True, # Assume busy on server error
+            "details": {
+                 "track_busy": is_track_busy,
+                 "agv_busy": True,
+                 "message": "Server error checking AGV status."
+            },
+            "error": str(e),
+        }), 500
 
 @app.post("/agv/send-task")
 def api_agv_send_task():
@@ -602,48 +550,68 @@ def api_agv_home():
 @app.post("/click")
 def click():
     rid_ = rid()
+
+    # MODIFIED: Perform pre-emptive busy check
+    if track_busy():
+        log.warning(f"{rid_} [/click] Rejected: Track is busy.")
+        return jsonify({"ok": False, "error": "Track is currently busy", "code": "TRACK_BUSY"}), 409
+
+    try:
+        agv_data = agv_fetch_all(req_id=rid_)
+        agvs = agv_data if isinstance(agv_data, list) else agv_data.get("data", [])
+        agv = agv_pick_one(agvs, AGV_ID)
+        if agv and agv_is_busy(agv):
+            st, tn = agv_task_status(agv)
+            error_msg = f"AGV is currently busy (status={st}, task={tn})"
+            log.warning(f"{rid_} [/click] Rejected: {error_msg}")
+            return jsonify({"ok": False, "error": error_msg, "code": "AGV_BUSY"}), 409
+    except Exception as e:
+        log.error(f"{rid_} [AGV] Pre-click AGV status check failed: {e}")
+        return jsonify({"ok": False, "error": f"Failed to get AGV status before command: {e}", "code": "AGV_CHECK_FAILED"}), 502
+    # End of busy check
+
     payload = request.get_json(force=True) or {}
     x = int(payload.get("x", 0))
     y = int(payload.get("y", 0))
     log.info(f"{rid_} [/click] recv x={x}, y={y} from {request.remote_addr}")
     if not (1 <= y <= 10):
         return jsonify({"ok": False, "error": f"invalid y={y} (expected 1..10)"}), 400
+
     agv_result = {"ok": False, "skipped": False, "base": AGV_BASE_URL}
     try:
-        data = agv_fetch_all(req_id=rid_)
-        agvs = data if isinstance(data, list) else data.get("data", [])
-        agv = agv_pick_one(agvs, AGV_ID)
-        if not agv:
-            msg = f"AGV id={AGV_ID} not found"
+        target_key = str(min(max(x, 1), 7))
+        target = AGV_TARGETS.get(target_key)
+        if not target:
+            msg = f"no target mapped for x={x} (mapped to {target_key})"
             log.error(f"{rid_} [AGV] {msg}")
             agv_result = {"ok": False, "error": msg, "base": AGV_BASE_URL}
         else:
-            busy_now = agv_is_busy(agv)
-            st0, tn0 = agv_task_status(agv)
-            log.info(f"{rid_} [AGV] initial status={st0} taskNumber={tn0} working={agv.get('working')} busy={busy_now}")
-            if busy_now:
-                agv_result = {"ok": False, "busy": True, "error": f"AGV {AGV_ID} busy (status={st0}, taskNumber={tn0})", "base": AGV_BASE_URL}
-            else:
-                target_key = str(min(max(x, 1), 7))
-                target = AGV_TARGETS.get(target_key)
-                if not target:
-                    msg = f"no target mapped for x={x} (mapped to {target_key})"
-                    log.error(f"{rid_} [AGV] {msg}")
-                    agv_result = {"ok": False, "error": msg, "base": AGV_BASE_URL}
-                else:
-                    st_resp = send_task_to_agv(target, req_id=rid_)
-                    agv_result = {"ok": True, **(st_resp if isinstance(st_resp, dict) else {})}
+            st_resp = send_task_to_agv(target, req_id=rid_)
+            agv_result = {"ok": True, **(st_resp if isinstance(st_resp, dict) else {})}
     except Exception as e:
         log.error(f"{rid_} [AGV] send error: {e}")
         agv_result = {"ok": False, "error": str(e), "base": AGV_BASE_URL}
+        # If AGV dispatch fails, we should not move the track either.
+        return jsonify({
+            "ok": False,
+            "x": x, "y": y,
+            "error": "AGV task dispatch failed, track movement cancelled.",
+            "agv_result": agv_result,
+            "track_job_started": False
+        }), 502
+
     deadline = READ_DEADLINE_DEFAULT
     idle_gap = IDLE_GAP_DEFAULT
+    
+    # We already checked track_busy() at the start, so this check is redundant but safe.
     if not track_busy():
         th = threading.Thread(target=track_move_worker, args=(y, rid(), deadline, idle_gap), daemon=True)
         th.start()
         track_started = True
     else:
+        # This case should theoretically not be reached due to the initial check.
         track_started = False
+
     return jsonify({
         "ok": bool(agv_result.get("ok")),
         "x": x, "y": y,
@@ -654,7 +622,6 @@ def click():
 # ---- MJPEG streaming route ----
 @app.get("/video.mjpg")
 def video_mjpg():
-    # 啟動相機擷取緒（只在需要時）
     if not _CAM_RUNNING.is_set():
         ok = camera_start()
         if not ok:
@@ -682,7 +649,6 @@ def _sig_handler(signum, frame):
     log.info(f"[SIGNAL] received {signum}, initiating graceful shutdown...")
     _SHUTDOWN_EVENT.set()
     _cleanup_all()
-    # 讓 Flask dev server 結束：拋 KeyboardInterrupt
     raise KeyboardInterrupt()
 
 for _sig in (signal.SIGINT, signal.SIGTERM):
@@ -697,5 +663,4 @@ if __name__ == "__main__":
     except Exception as e:
         log.error(f"[BOOT] Initial serial port setup failed: {e}")
     log.info("[BOOT] Starting Flask application...")
-    # threaded=True 讓 MJPEG generator 不會阻塞
     app.run(host="0.0.0.0", port=8000, debug=False, use_reloader=False, threaded=True)

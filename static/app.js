@@ -21,9 +21,8 @@ const INITIAL_VIEW = {
 };
 
 // Polling config
-const AGV_POLL_RATE_MS = 500;
-let agvPollingIntervalId = null;
-let currentAgvTaskNumber = null;
+const SYSTEM_POLL_RATE_MS = 500;
+let systemPollingIntervalId = null;
 
 /* =====
    Scene
@@ -130,7 +129,7 @@ function mkBtn(text) {
 }
 
 const btnHome  = mkBtn('AGV HOME');
-const btnStat  = mkBtn('AGV STATUS');
+const btnStat  = mkBtn('SYSTEM STATUS');
 uiBox.appendChild(btnHome);
 uiBox.appendChild(btnStat);
 
@@ -198,68 +197,58 @@ const pointer = new THREE.Vector2();
 /* ======================
    Busy status & Polling
    ====================== */
-let isAgvBusy = false;
+let isSystemBusy = false;
 
-function updateAgvBusyStatus(busy, message = "", agvRawStatus = null) {
-  isAgvBusy = busy;
-  if (isAgvBusy) {
-    statusEl.innerHTML = `<span class="err" style="color:#fca5a5">AGV 忙碌中：${message || '上一個工作尚未完成'}，請稍候。</span>`;
+function updateSystemBusyStatus(busy, message = "") {
+  isSystemBusy = busy;
+  if (isSystemBusy) {
+    statusEl.innerHTML = `<span class="err" style="color:#fca5a5">系統忙碌中：${message || '上一個工作尚未完成'}，請稍候。</span>`;
+    hideHover();
   } else {
-    if (statusEl.innerText.trim() === '' || statusEl.innerHTML.includes("AGV 忙碌中")) {
-      statusEl.textContent = `AGV 就緒，可點擊方塊送出命令。`;
-    }
-    if (agvRawStatus && (agvRawStatus.status === "WAITING" || agvRawStatus.status === "CHARGING" || agvRawStatus.status === "IDLE")) {
-      stopPollingAgvStatus();
+    // Only update the message if the state is changing from busy to not-busy
+    if (statusEl.innerHTML.includes("系統忙碌中") || statusEl.innerHTML.includes("Error")) {
+         statusEl.innerHTML = `<span class="ok" style="color:#86efac">系統就緒：${message || '可點擊方塊送出新命令。'}</span>`;
     }
   }
 }
 
-async function pollAgvStatus() {
+async function pollSystemStatus() {
   try {
     const resp = await fetch("/agv/status-summary");
     const data = await resp.json();
-    if (resp.ok && data.agv_busy !== undefined) {
-      if (!data.agv_busy) {
-        updateAgvBusyStatus(false, "AGV 就緒", data.agv_raw_status);
-        stopPollingAgvStatus();
-        return;
-      }
-      updateAgvBusyStatus(data.agv_busy, data.agv_status_message, data.agv_raw_status);
-      if (currentAgvTaskNumber && data.agv_raw_status?.task?.taskNumber === currentAgvTaskNumber) {
-        const taskStatus = data.agv_raw_status.task.status;
-        if (taskStatus === "COMPLETED" || taskStatus === "FAILED" || taskStatus === "CANCELLED") {
-          stopPollingAgvStatus();
-        }
-      } else if (currentAgvTaskNumber && !data.agv_raw_status?.task) {
-        stopPollingAgvStatus();
+    if (resp.ok && data.system_busy !== undefined) {
+      if (data.system_busy) {
+        updateSystemBusyStatus(true, data.details?.message || "執行中...");
+      } else {
+        updateSystemBusyStatus(false, "任務完成");
+        stopPollingSystemStatus();
       }
     } else {
-      console.error("Failed to fetch AGV status summary:", data);
-      updateAgvBusyStatus(true, data.error || "Server 無法取得 AGV 狀態。");
+      console.error("Failed to fetch system status summary:", data);
+      updateSystemBusyStatus(true, data.error || "Server 無法取得系統狀態。");
     }
   } catch (error) {
-    console.error("Error polling AGV status:", error);
-    updateAgvBusyStatus(true, `通訊錯誤：${error.message}`);
+    console.error("Error polling system status:", error);
+    updateSystemBusyStatus(true, `通訊錯誤：${error.message}`);
   }
 }
 
-function startPollingAgvStatus(taskNumber = null) {
-  if (agvPollingIntervalId === null) {
-    agvPollingIntervalId = setInterval(pollAgvStatus, AGV_POLL_RATE_MS);
-    currentAgvTaskNumber = taskNumber;
+function startPollingSystemStatus() {
+  if (systemPollingIntervalId === null) {
+    pollSystemStatus(); // Poll immediately
+    systemPollingIntervalId = setInterval(pollSystemStatus, SYSTEM_POLL_RATE_MS);
   }
 }
 
-function stopPollingAgvStatus() {
-  if (agvPollingIntervalId !== null) {
-    clearInterval(agvPollingIntervalId);
-    agvPollingIntervalId = null;
-    currentAgvTaskNumber = null;
+function stopPollingSystemStatus() {
+  if (systemPollingIntervalId !== null) {
+    clearInterval(systemPollingIntervalId);
+    systemPollingIntervalId = null;
   }
 }
 
 /* ===============
-   AGV interactions
+   Interactions
    =============== */
 function renderRightTopStatus(objOrString, isError = false) {
   statPanel.style.display = 'block';
@@ -274,47 +263,39 @@ function clearRightTopStatus() {
   statPanel.textContent = '';
   statPanel.style.display = 'none';
 }
+
 function sendClick(x, y) {
-  if (isAgvBusy) {
-    console.log("AGV busy; blocked new command.");
+  if (isSystemBusy) {
+    console.log("System busy; blocked new command.");
     return;
   }
   statusEl.textContent = `送出：x=${x}, y=${y} ...`;
-  updateAgvBusyStatus(true, "送出中...");
+  updateSystemBusyStatus(true, "正在分派任務...");
+
   fetch("/click", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ x, y })
   })
   .then(async (resp) => {
-    let d;
-    try { d = await resp.json(); }
-    catch (e) { throw new Error(`Invalid JSON response: ${e}`); }
-    if (d.agv_result?.busy) {
-      updateAgvBusyStatus(true, d.agv_result.error || `AGV 忙碌, 狀態: ${d.agv_result.status}`);
-      stopPollingAgvStatus();
-      return;
+    const data = await resp.json();
+    // If the server rejected the command (e.g., busy), unlock the UI.
+    if (!resp.ok || !data.ok) {
+        const errorMsg = data.error || '未知的錯誤';
+        statusEl.innerHTML = `<span class="err" style="color:#fca5a5">指令失敗: ${errorMsg}</span>`;
+        updateSystemBusyStatus(false, "指令被伺服器拒絕，請重試。");
+        stopPollingSystemStatus(); // Ensure no polling is running
+        return;
     }
-    if (!d.ok) {
-      statusEl.innerHTML = `<span class="err" style="color:#fca5a5">Error: ${d.error || d.agv_result?.error || 'unknown'}</span>`;
-      updateAgvBusyStatus(true, d.error || d.agv_result?.error || 'unknown');
-      stopPollingAgvStatus();
-      return;
-    }
-    if (d.agv_result?.noop) {
-      statusEl.innerHTML = `狀態：<span class="ok" style="color:#86efac">AGV 已在目標點（${d.agv_result.target}）</span>；確認軌道...`;
-      updateAgvBusyStatus(true, "AGV no-op，等待軌道完成...");
-      startPollingAgvStatus(null);
-      return;
-    }
-    statusEl.innerHTML = `狀態：<span class="ok" style="color:#86efac">OK</span> （伺服器回覆 x=${d.x}, y=${d.y}）`;
-    updateAgvBusyStatus(true, "AGV 任務已送出，等待完成...");
-    startPollingAgvStatus(d.agv_result ? d.agv_result.taskNumber : null);
+
+    // Command was accepted by the server. Start polling for completion.
+    statusEl.innerHTML = `狀態：<span class="ok" style="color:#86efac">OK</span> (任務已分派 x=${data.x}, y=${data.y})`;
+    startPollingSystemStatus();
   })
   .catch(err => {
-    statusEl.innerHTML = `狀態：<span class="err" style="color:#fca5a5">Request failed: ${err.message || err}</span>`;
-    updateAgvBusyStatus(true, `Request failed: ${err.message || err}`);
-    stopPollingAgvStatus();
+    statusEl.innerHTML = `狀態：<span class="err" style="color:#fca5a5">請求失敗: ${err.message || err}</span>`;
+    updateSystemBusyStatus(false, `請求失敗，請檢查網路連線。`);
+    stopPollingSystemStatus();
   });
 }
 
@@ -329,7 +310,7 @@ function setPointerFromEvent(event) {
 }
 const EPS = 0.002;
 function showHoverFace(mesh, faceType) {
-  if (isAgvBusy) return;
+  if (isSystemBusy) return;
   hoverPlane.visible = true;
   hoverPlane.position.copy(mesh.position);
   hoverPlane.rotation.set(0,0,0);
@@ -346,7 +327,7 @@ function hideHover(){ hoverPlane.visible = false; }
    Mouse events
    ================ */
 function onMouseMove(event) {
-  if (isAgvBusy) { hideHover(); return; }
+  if (isSystemBusy) { hideHover(); return; }
   setPointerFromEvent(event);
   raycaster.setFromCamera(pointer, camera);
   const hits = raycaster.intersectObjects(pickMeshes, false);
@@ -360,7 +341,7 @@ function onMouseMove(event) {
   hideHover();
 }
 function onClick(event) {
-  if (isAgvBusy) { console.log("AGV busy; click ignored."); return; }
+  if (isSystemBusy) { console.log("System busy; click ignored."); return; }
   setPointerFromEvent(event);
   raycaster.setFromCamera(pointer, camera);
   const hits = raycaster.intersectObjects(pickMeshes, false);
@@ -380,38 +361,30 @@ renderer.domElement.addEventListener('click', onClick);
    ==================== */
 
 btnHome.addEventListener('click', () => {
-  if (isAgvBusy) return;
+  if (isSystemBusy) return;
   clearRightTopStatus();
   statusEl.textContent = `送出：AGV HOME (1001) ...`;
-  updateAgvBusyStatus(true, "Sending AGV HOME...");
-  fetch('/agv/send-task', {
+  updateSystemBusyStatus(true, "正在發送 AGV HOME 指令...");
+  fetch('/agv/home', {
     method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ target: '1001' })
+    headers: {'Content-Type':'application/json'}
   })
   .then(r => r.json().then(d => ({ok:r.ok, d})))
   .then(({ok, d}) => {
     if (!ok || !d.ok) {
       const msg = d.error || d.message || 'AGV HOME failed';
-      if (String(msg).includes('already the target')) {
-        statusEl.innerHTML = `狀態：<span class="ok" style="color:#86efac">AGV 已在 HOME (1001)</span>；確認軌道...`;
-        updateAgvBusyStatus(true, "AGV no-op；等待軌道完成...");
-        startPollingAgvStatus(null);
-        return;
-      }
       statusEl.innerHTML = `<span class="err" style="color:#fca5a5">Error: ${msg}</span>`;
-      updateAgvBusyStatus(true, msg);
-      stopPollingAgvStatus();
+      updateSystemBusyStatus(false, msg);
+      stopPollingSystemStatus();
       return;
     }
     statusEl.innerHTML = `狀態：<span class="ok" style="color:#86efac">已送出 HOME</span>，等待完成...`;
-    updateAgvBusyStatus(true, "AGV 任務已送出，等待完成...");
-    startPollingAgvStatus(d.taskNumber || null);
+    startPollingSystemStatus();
   })
   .catch(err => {
-    statusEl.innerHTML = `狀態：<span class="err" style="color:#fca5a5">Request failed: ${err.message || err}</span>`;
-    updateAgvBusyStatus(true, `Request failed: ${err.message || err}`);
-    stopPollingAgvStatus();
+    statusEl.innerHTML = `狀態：<span class="err" style="color:#fca5a5">請求失敗: ${err.message || err}</span>`;
+    updateSystemBusyStatus(false, `請求失敗: ${err.message || err}`);
+    stopPollingSystemStatus();
   });
 });
 
@@ -440,3 +413,6 @@ window.addEventListener('resize', () => {
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
+
+// Initial status check on page load
+pollSystemStatus();
