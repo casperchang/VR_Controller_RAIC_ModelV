@@ -6,11 +6,13 @@ import atexit
 import signal
 import threading
 from typing import Optional, List, Dict, Set, Tuple
-
+import cv2
 from flask import Flask, render_template, request, jsonify, Response
 import serial
 import requests
 import logging
+import yaml
+from camera import BaslerCamera # MODIFIED: Import BaslerCamera
 
 # ========= Logging (console + file) =========
 logging.basicConfig(
@@ -26,10 +28,38 @@ log = logging.getLogger("ivc")
 def rid() -> str:
     return f"[{time.strftime('%H:%M:%S')}.{int((time.time()%1)*1000):03d}]"
 
+# ========= GPIO and LED control =========
+import Jetson.GPIO as GPIO
+import atexit
+
+def gpio_cleanup():
+    logger.debug(f"[GPIO][gpio_cleanup] GPIO cleanup")
+    GPIO.cleanup()
+class LED:
+    def __init__(self, pin=7):
+        self.led_pin = pin
+        self.led_status = True
+        GPIO.setmode(GPIO.BOARD)
+        GPIO.setup(self.led_pin, GPIO.OUT, initial=GPIO.LOW)
+        atexit.register(GPIO.cleanup)  # auto cleanup on exit
+        log.info("[GPIO][LED] Initialized")
+
+    def switch_led(self):
+        self.led_status = not self.led_status
+        GPIO.output(self.led_pin, GPIO.HIGH if self.led_status else GPIO.LOW)
+        log.info(f"[GPIO][LED] Led status: {self.led_status}")
+
+# Example usage
+# led = LED(7)
+# for i in range(100):
+#     led.switch_led()  # toggle LED
+#     time.sleep(2)
+
+
 # ========= Serial & timing config =========
 RS485_PORT = os.getenv("RS485_PORT", "/dev/ttyUSB0")
 RS485_BAUD = int(os.getenv("RS485_BAUD", "115200"))
-RS485_BYTESIZE = 8        # 8O1
+RS485_BYTESIZE = 8
 RS485_PARITY = "O"
 RS485_STOPBITS = 1
 RS485_TIMEOUT = float(os.getenv("RS485_TIMEOUT", "0.5"))
@@ -41,7 +71,8 @@ IDLE_GAP_DEFAULT = float(os.getenv("RS485_IDLE_GAP", "1.0"))
 CLICK_VEL = 5000
 CLICK_ACC_MS = 100
 CLICK_DEC_MS = 100
-CLICK_Y_STOPS_CM = [165 - (10 - i)*18.1 for i in range(1, 11)]
+# CLICK_Y_STOPS_CM = [165 - (10 - i)*18.1 for i in range(1, 11)]
+CLICK_Y_STOPS_CM = [166 - (10 - i)*18.1 for i in range(1, 11)]
 
 # ========= AGV proxy config =========
 AGV_BASE_URL = os.getenv("AGV_BASE_URL", "http://192.168.0.172:8080")
@@ -61,6 +92,38 @@ SER: Optional[serial.Serial] = None
 SER_LOCK = threading.Lock()
 _TRACK_LOCK = threading.Lock()
 _SHUTDOWN_EVENT = threading.Event()
+
+# ========= MODIFIED: Global Camera Instance =========
+try:
+    with open("config.yaml", "r", encoding="utf-8") as f:
+        _CFG = yaml.safe_load(f) or {}
+    CAM_CFG = _CFG.get("Camera", {}) or {}
+except Exception as e:
+    log.warning(f"[CAM] load config.yaml failed: {e}")
+    CAM_CFG = {}
+
+CAMERA: Optional[BaslerCamera] = None
+
+def camera_init():
+    global CAMERA
+    if CAMERA is None:
+        log.info("[CAM] Initializing BaslerCamera instance...")
+        try:
+            CAMERA = BaslerCamera(camera_config=CAM_CFG)
+            if not CAMERA.is_camera_initialized:
+                log.error("[CAM] Camera instance created, but failed to initialize device.")
+                CAMERA = None # Set back to None if it failed
+        except Exception as e:
+            log.error(f"[CAM] Failed to instantiate BaslerCamera: {e}", exc_info=True)
+            CAMERA = None
+
+def camera_close():
+    global CAMERA
+    if CAMERA:
+        log.info("[CAM] Closing camera...")
+        CAMERA.close()
+        CAMERA = None
+# --- End of Camera modifications ---
 
 def track_busy() -> bool:
     return _TRACK_LOCK.locked()
@@ -130,31 +193,19 @@ def serial_get_or_raise() -> serial.Serial:
         return SER
     raise serial.SerialException("Serial port is not available or could not be re-opened.")
 
-# ========= Message classes =========
-MSG_CLASS: Dict[str, Dict[str, str]] = {
-    "DONE":         {"type": "success", "text": "Movement completed."},
-    "HOME_OK":      {"type": "success", "text": "Homing completed successfully."},
-    "RESTART_OK":   {"type": "success", "text": "Controller restarted successfully."},
-    "ERROR_HOME":   {"type": "error",   "text": "Homing failed."},
-    "ERROR_REPEAT": {"type": "error",   "text": "Repeated/duplicate command ignored."},
-    "ERROR_DRIVER": {"type": "error",   "text": "Motor driver fault."},
-    "ERROR_INPOS":  {"type": "error",   "text": "Position not reached / in-position error."},
-    "NOT_HOME_OK":  {"type": "error",   "text": "Not at HOME (reported as OK)."},
-    "OK":           {"type": "success", "text": "Command acknowledged/OK."}
-}
+MSG_CLASS: Dict[str, Dict[str, str]] = { "DONE": {"type": "success", "text": "Movement completed." }, "HOME_OK": {"type": "success", "text": "Homing completed successfully." }, "RESTART_OK": {"type": "success", "text": "Controller restarted successfully." }, "ERROR_HOME": {"type": "error",   "text": "Homing failed." }, "ERROR_REPEAT": {"type": "error",   "text": "Repeated/duplicate command ignored." }, "ERROR_DRIVER": {"type": "error",   "text": "Motor driver fault." }, "ERROR_INPOS":  {"type": "error",   "text": "Position not reached / in-position error." }, "NOT_HOME_OK":  {"type": "error",   "text": "Not at HOME (reported as OK)." }, "OK":           {"type": "success", "text": "Command acknowledged/OK." } }
 ERROR_CODES: Set[str] = {k for k, v in MSG_CLASS.items() if v["type"] == "error"}
 TERMINAL_OK: Set[str] = {"DONE", "HOME_OK", "RESTART_OK"}
 
-# ========= AGV helpers =========
 def agv_url(path: str) -> str:
     base = AGV_BASE_URL.rstrip("/")
     if not path.startswith("/"): path = "/" + path
     return f"{base}{path}"
 
 def http_get(url: str, timeout: float, req_id: str = "") -> requests.Response:
-    log.info(f"{req_id} [AGV] GET {url}")
+    # log.info(f"{req_id} [AGV] GET {url}")
     resp = requests.get(url, timeout=timeout)
-    log.info(f"{req_id} [AGV] <- HTTP {resp.status_code} {resp.text[:300]}")
+    # log.info(f"{req_id} [AGV] <- HTTP {resp.status_code} {resp.text[:300]}")
     return resp
 
 def http_post_json(url: str, payload: dict, timeout: float, req_id: str = "") -> requests.Response:
@@ -178,10 +229,8 @@ def send_task_to_agv(target: str, req_id: str = "") -> dict:
             resp = http_post_json(url, {"agvId": AGV_ID, "target": target}, AGV_REQ_TIMEOUT_S, req_id=req_id)
             if resp.status_code == 200:
                 return resp.json() if resp.content else {"ok": True}
-            try:
-                data = resp.json()
-            except Exception:
-                data = {"error": resp.text}
+            try: data = resp.json()
+            except Exception: data = {"error": resp.text}
             msg = (data.get("message") or data.get("error") or "")
             if resp.status_code == 400 and "current location is already the target tag number" in msg:
                 logging.warning(f"{req_id} [AGV] send-task noop: already at target ({target})")
@@ -205,31 +254,33 @@ def agv_is_busy(agv: dict) -> bool:
     working = bool(agv.get("working", False))
     if not t: return working
     status = str(t.get("status", "")).upper()
-    return not (status in ("COMPLETED", "FAILED", "CANCELLED", "NONE", "IDLE", "WAITING"))
+    
+    # A task is NOT busy only if it's explicitly completed, failed, idle, or has no status.
+    # We now consider 'WAITING' as a busy state, as the AGV is not yet ready for a new command.
+    is_not_busy = status in ("COMPLETED", "FAILED", "CANCELLED", "IDLE", "NONE")
+    
+    return not is_not_busy
 
 def agv_task_status(agv: dict) -> Tuple[str, Optional[str]]:
     t = (agv or {}).get("task")
     if not t: return ("NONE", None)
     return (str(t.get("status", "NONE")).upper(), str(t.get("taskNumber")) if "taskNumber" in t else None)
 
-# ========= Track worker =========
 def make_command(head: str, *args: int) -> bytes:
     head = head.strip().upper()
     parts = [head] + [str(int(v)) for v in args]
     return ",".join(parts).encode("ascii") + CR
 
 def cm_to_units(cm: float) -> int:
-    return int(round(cm * 1000.0))  # cm→0.01mm
+    return int(round(cm * 1000.0))
 
 def classify_messages(lines: List[str]) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
     for raw in lines:
         key = raw.strip()
         meta = MSG_CLASS.get(key)
-        if meta is None:
-            out.append({"code": key, "type": "info", "text": key})
-        else:
-            out.append({"code": key, "type": meta["type"], "text": meta["text"]})
+        if meta is None: out.append({"code": key, "type": "info", "text": key})
+        else: out.append({"code": key, "type": meta["type"], "text": meta["text"]})
     return out
 
 def read_messages_until(ser: serial.Serial, overall_deadline_s: float, idle_gap_s: Optional[float], req_id: str = "") -> Optional[List[str]]:
@@ -246,7 +297,7 @@ def read_messages_until(ser: serial.Serial, overall_deadline_s: float, idle_gap_
         if got_any_data and idle_gap_s is not None and (now - last_rx_time) > idle_gap_s:
             log.info(f"{req_id} [TRACK] read: idle gap {idle_gap_s:.2f}s reached."); break
         try:
-            b = ser.read(1)  # timeout=RS485_TIMEOUT
+            b = ser.read(1)
         except serial.SerialTimeoutException:
             if not got_any_data: log.debug(f"{req_id} [TRACK] read: initial no byte.")
             continue
@@ -305,116 +356,34 @@ def track_move_worker(y: int, req_id: str, deadline: float, idle_gap: float):
     finally:
         _TRACK_LOCK.release()
 
-# ========= Camera (Basler-only, bufferless) - UNCHANGED =========
-# 讀取 config.yaml 的 Camera 區塊
-import yaml
-try:
-    with open("config.yaml","r",encoding="utf-8") as f:
-        _CFG = yaml.safe_load(f) or {}
-    CAM_CFG = _CFG.get("Camera", {}) or {}
-except Exception as e:
-    log.warning(f"[CAM] load config.yaml failed: {e}")
-    CAM_CFG = {}
-
-_CAM_THREAD = None
-_CAM_LOCK = threading.Lock()
-_CAM_LAST = None
-_CAM_RUNNING = threading.Event()
-_CAM_OPENED = threading.Event()
-_CAM_ERR = None
-_CAM_START_LOCK = threading.Lock()
-
-def _basler_loop():
-    global _CAM_LAST, _CAM_ERR
-    try:
-        import pypylon.pylon as pylon
-        camera = pylon.InstantCamera(pylon.TlFactory.GetInstance().CreateFirstDevice())
-        camera.Open()
-        try:
-            converter = pylon.ImageFormatConverter()
-            converter.OutputPixelFormat = pylon.PixelType_BGR8packed
-            converter.OutputBitAlignment = pylon.OutputBitAlignment_MsbAligned
-            camera.StartGrabbing(
-                pylon.GrabStrategy_LatestImageOnly,
-                pylon.GrabLoop_ProvidedByUser
-            )
-            log.info("[CAM] Basler camera started (LatestImageOnly, ProvidedByUser).")
-            _CAM_OPENED.set()
-            while _CAM_RUNNING.is_set() and camera.IsGrabbing():
-                grab = camera.RetrieveResult(5, pylon.TimeoutHandling_Return)
-                if not grab: continue
-                if not grab.GrabSucceeded():
-                    grab.Release()
-                    continue
-                img = converter.Convert(grab).GetArray()
-                grab.Release()
-                with _CAM_LOCK: _CAM_LAST = img
-        finally:
-            try:
-                if camera.IsGrabbing(): camera.StopGrabbing()
-            except Exception: pass
-            try: camera.Close()
-            except Exception: pass
-            log.info("[CAM] Basler camera closed.")
-    except Exception as e:
-        _CAM_ERR = e
-        log.error(f"[CAM] Basler loop error: {e}", exc_info=True)
-    finally:
-        _CAM_OPENED.clear()
-
-def camera_start():
-    global _CAM_THREAD, _CAM_ERR
-    with _CAM_START_LOCK:
-        if _CAM_THREAD and _CAM_THREAD.is_alive(): return True
-        _CAM_ERR = None
-        _CAM_RUNNING.set()
-        _CAM_THREAD = threading.Thread(target=_basler_loop, name="BaslerLoop", daemon=True)
-        _CAM_THREAD.start()
-    t0 = time.time()
-    while time.time() - t0 < 3.0:
-        if _CAM_OPENED.is_set():
-            log.info("[CAM] camera opened OK.")
-            return True
-        if _CAM_ERR is not None: break
-        time.sleep(0.02)
-    with _CAM_START_LOCK: _CAM_RUNNING.clear()
-    if _CAM_ERR: log.error(f"[CAM] failed to open camera: {_CAM_ERR}")
-    else: log.error("[CAM] camera open timeout.")
-    return False
-
-def camera_close():
-    _CAM_RUNNING.clear()
-    t = None
-    if _CAM_THREAD and _CAM_THREAD.is_alive(): t = _CAM_THREAD
-    if t: t.join(timeout=2.0)
-    log.info("[CAM] camera closed")
-
-def get_latest_jpeg(quality=80):
-    import cv2
-    with _CAM_LOCK:
-        img = None if _CAM_LAST is None else _CAM_LAST.copy()
-    if img is None: return None
-    q = max(50, min(95, int(quality)))
-    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), q])
-    if not ok: return None
-    return buf.tobytes()
-
+# MODIFIED: mjpeg_generator now uses the CAMERA instance
 def mjpeg_generator(jpeg_quality=80):
+    if CAMERA is None or not CAMERA.is_camera_initialized:
+        log.warning("[CAM] MJPEG stream requested but camera is not available.")
+        return
     try:
         import itertools
         for _ in itertools.count():
             if _SHUTDOWN_EVENT.is_set(): break
-            b = get_latest_jpeg(jpeg_quality)
-            if b is None:
+            ret, img = CAMERA.read()
+            if not ret or img is None:
                 time.sleep(0.02)
                 continue
+
+            q = max(50, min(95, int(jpeg_quality)))
+            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), q])
+            if not ok: continue
+
             yield (b"--frame\r\n"
                    b"Content-Type: image/jpeg\r\n"
                    b"Cache-Control: no-cache\r\n"
                    b"Pragma: no-cache\r\n"
-                   b"\r\n" + b + b"\r\n")
-    except GeneratorExit: pass
-    except Exception as e: log.warning(f"[CAM] generator error: {e}")
+                   b"\r\n" + buf.tobytes() + b"\r\n")
+    except GeneratorExit:
+        log.info("[CAM] MJPEG client disconnected.")
+    except Exception as e:
+        log.warning(f"[CAM] generator error: {e}")
+
 
 # ========= Routes =========
 @app.route("/")
@@ -426,7 +395,6 @@ def status():
     open_flag = bool(SER and getattr(SER, "is_open", False))
     return jsonify({"track_busy": track_busy(), "serial_open": open_flag, "port": RS485_PORT})
 
-# ---- AGV routes ----
 @app.get("/agv/test")
 def agv_test():
     base = request.args.get("base") or AGV_BASE_URL
@@ -468,15 +436,8 @@ def api_agv_status_summary():
             msg = f"AGV id={AGV_ID} not found"
             log.error(f"{rid_} [AGV] status-summary: {msg}")
             return jsonify({
-                "ok": False,
-                "system_busy": True,  # Assume busy if AGV is not found
-                "details": {
-                    "track_busy": is_track_busy,
-                    "agv_busy": True,
-                    "message": msg,
-                },
-                "error": msg,
-                "agv_raw_status": {}
+                "ok": False, "system_busy": True, "details": { "track_busy": is_track_busy, "agv_busy": True, "message": msg },
+                "error": msg, "agv_raw_status": {}
             }), 500
 
         is_agv_busy = agv_is_busy(agv)
@@ -489,37 +450,19 @@ def api_agv_status_summary():
         combined_message = f"{agv_msg_part} | {track_msg_part}"
 
         return jsonify({
-            "ok": True,
-            "system_busy": system_is_busy,
-            "details": {
-                "track_busy": is_track_busy,
-                "agv_busy": is_agv_busy,
-                "message": combined_message,
-            },
+            "ok": True, "system_busy": system_is_busy, "details": { "track_busy": is_track_busy, "agv_busy": is_agv_busy, "message": combined_message },
             "agv_raw_status": agv
         })
     except requests.exceptions.RequestException as e:
         log.error(f"{rid_} [AGV] status-summary: HTTP request failed: {e}")
         return jsonify({
-            "ok": False,
-            "system_busy": True, # Assume busy on comms error
-            "details": {
-                "track_busy": is_track_busy,
-                "agv_busy": True,
-                "message": "Failed to connect to AGV system."
-            },
+            "ok": False, "system_busy": True, "details": { "track_busy": is_track_busy, "agv_busy": True, "message": "Failed to connect to AGV system." },
             "error": str(e),
         }), 502
     except Exception as e:
         log.error(f"{rid_} [AGV] status-summary: Unexpected error: {e}")
         return jsonify({
-            "ok": False,
-            "system_busy": True, # Assume busy on server error
-            "details": {
-                 "track_busy": is_track_busy,
-                 "agv_busy": True,
-                 "message": "Server error checking AGV status."
-            },
+            "ok": False, "system_busy": True, "details": { "track_busy": is_track_busy, "agv_busy": True, "message": "Server error checking AGV status." },
             "error": str(e),
         }), 500
 
@@ -528,8 +471,7 @@ def api_agv_send_task():
     rid_ = rid()
     payload = request.get_json(silent=True) or {}
     target = str(payload.get("target", "")).strip()
-    if not target:
-        return jsonify({"ok": False, "error": "missing target"}), 400
+    if not target: return jsonify({"ok": False, "error": "missing target"}), 400
     try:
         data = send_task_to_agv(target, req_id=rid_)
         return jsonify({"ok": True, **(data if isinstance(data, dict) else {})})
@@ -550,12 +492,9 @@ def api_agv_home():
 @app.post("/click")
 def click():
     rid_ = rid()
-
-    # MODIFIED: Perform pre-emptive busy check
     if track_busy():
         log.warning(f"{rid_} [/click] Rejected: Track is busy.")
         return jsonify({"ok": False, "error": "Track is currently busy", "code": "TRACK_BUSY"}), 409
-
     try:
         agv_data = agv_fetch_all(req_id=rid_)
         agvs = agv_data if isinstance(agv_data, list) else agv_data.get("data", [])
@@ -568,7 +507,6 @@ def click():
     except Exception as e:
         log.error(f"{rid_} [AGV] Pre-click AGV status check failed: {e}")
         return jsonify({"ok": False, "error": f"Failed to get AGV status before command: {e}", "code": "AGV_CHECK_FAILED"}), 502
-    # End of busy check
 
     payload = request.get_json(force=True) or {}
     x = int(payload.get("x", 0))
@@ -579,7 +517,10 @@ def click():
 
     agv_result = {"ok": False, "skipped": False, "base": AGV_BASE_URL}
     try:
-        target_key = str(min(max(x, 1), 7))
+        # AGV_TARGETS maps "1".."6" to target IDs. "7" is also defined in AGV_TARGETS for the right side click,
+        # but the patrol uses x=1..6.
+        target_key = str(min(max(x, 1), 7)) # Original logic: ensures x is within mapped range, includes 7 for right face
+        # For the patrol, we explicitly limit x to 1-6 in JS, so this will map correctly.
         target = AGV_TARGETS.get(target_key)
         if not target:
             msg = f"no target mapped for x={x} (mapped to {target_key})"
@@ -591,55 +532,89 @@ def click():
     except Exception as e:
         log.error(f"{rid_} [AGV] send error: {e}")
         agv_result = {"ok": False, "error": str(e), "base": AGV_BASE_URL}
-        # If AGV dispatch fails, we should not move the track either.
         return jsonify({
-            "ok": False,
-            "x": x, "y": y,
-            "error": "AGV task dispatch failed, track movement cancelled.",
-            "agv_result": agv_result,
-            "track_job_started": False
+            "ok": False, "x": x, "y": y, "error": "AGV task dispatch failed, track movement cancelled.",
+            "agv_result": agv_result, "track_job_started": False
         }), 502
 
     deadline = READ_DEADLINE_DEFAULT
     idle_gap = IDLE_GAP_DEFAULT
-    
-    # We already checked track_busy() at the start, so this check is redundant but safe.
     if not track_busy():
         th = threading.Thread(target=track_move_worker, args=(y, rid(), deadline, idle_gap), daemon=True)
         th.start()
         track_started = True
     else:
-        # This case should theoretically not be reached due to the initial check.
         track_started = False
 
     return jsonify({
-        "ok": bool(agv_result.get("ok")),
-        "x": x, "y": y,
-        "agv_result": agv_result,
-        "track_job_started": track_started
+        "ok": bool(agv_result.get("ok")), "x": x, "y": y,
+        "agv_result": agv_result, "track_job_started": track_started
     })
 
-# ---- MJPEG streaming route ----
 @app.get("/video.mjpg")
 def video_mjpg():
-    if not _CAM_RUNNING.is_set():
-        ok = camera_start()
-        if not ok:
-            return jsonify({"ok": False, "error": f"camera open failed: {_CAM_ERR}"}), 503
+    # MODIFIED: Ensure camera is initialized before streaming
+    if CAMERA is None or not CAMERA.check_open():
+        log.warning("[CAM] /video.mjpg requested but camera not open, attempting re-init for stream.")
+        camera_init() # Try to init camera if not already open
+        if CAMERA is None or not CAMERA.check_open():
+             return jsonify({"ok": False, "error": "camera is not initialized or could not be opened"}), 503
+
     return Response(mjpeg_generator(80),
                     mimetype="multipart/x-mixed-replace; boundary=frame",
                     headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
+# ---- NEW: Capture Endpoint ----
+@app.post("/capture")
+def capture_image():
+    rid_ = rid()
+    # log.info(f"{rid_} [/capture] Received capture request.")
+    
+    # MODIFIED: Get x and y from JSON body
+    payload = request.get_json(silent=True) or {}
+    x_pos = payload.get('x', 'unknown')
+    y_pos = payload.get('y', 'unknown')
+    # log.info(f"{rid_} [/capture] Received capture request. x={x_pos}, y={y_pos}")
+
+    # log the position, datetime of the request. I want to analyze from log to know if the patrol is working for each position for a long time.
+    log.info(f"{rid_} [/capture] Capture requested at position x={x_pos}, y={y_pos} at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
+    return jsonify({"ok": True, "message": "Image captured successfully", "filename": "filename"})
+
+
+    # if CAMERA is None or not CAMERA.is_camera_initialized:
+    #     log.error(f"{rid_} [/capture] Aborted: Camera is not available.")
+    #     return jsonify({"ok": False, "error": "Camera not available"}), 503
+
+    # try:
+    #     ret, img = CAMERA.read()
+    #     if not ret or img is None:
+    #         log.error(f"{rid_} [/capture] Failed to read frame from camera.")
+    #         return jsonify({"ok": False, "error": "Failed to read frame from camera"}), 500
+
+    #     capture_dir = "captured"
+    #     os.makedirs(capture_dir, exist_ok=True)
+        
+    #     timestamp = time.strftime("%Y%m%d_%H%M%S")
+        
+    #     # MODIFIED: Filename format to include x and y
+    #     filename = f"captured_position{int(x_pos):02}{int(y_pos):02}_{timestamp}.jpg"
+    #     filepath = os.path.join(capture_dir, filename)
+        
+    #     # Save the image
+    #     cv2.imwrite(filepath, img)
+    #     log.info(f"{rid_} [/capture] Image successfully saved to {filepath}")
+        
+    #     return jsonify({"ok": True, "message": "Image captured successfully", "filename": filename})
+
+    # except Exception as e:
+    #     log.exception(f"{rid_} [/capture] An error occurred during capture: {e}")
+    #     return jsonify({"ok": False, "error": f"An unexpected error occurred: {e}"}), 500
+
 # ========= Startup / Shutdown =========
 def _cleanup_all():
-    try:
-        camera_close()
-    except Exception:
-        pass
-    try:
-        serial_close()
-    except Exception:
-        pass
+    camera_close()
+    serial_close()
 
 @atexit.register
 def _atexit_cleanup():
@@ -662,5 +637,9 @@ if __name__ == "__main__":
         serial_init()
     except Exception as e:
         log.error(f"[BOOT] Initial serial port setup failed: {e}")
+    
+    # MODIFIED: Initialize camera on startup
+    camera_init()
+
     log.info("[BOOT] Starting Flask application...")
     app.run(host="0.0.0.0", port=8000, debug=False, use_reloader=False, threaded=True)

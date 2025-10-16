@@ -13,7 +13,7 @@ Camera:
     camera_type: "Basler"
     reverse_X: false
     reverse_Y: false
-    exposure_time: 3000
+    exposure_time: 10000
     frame_rate: 60.0
     width: 1600
     height: 1200

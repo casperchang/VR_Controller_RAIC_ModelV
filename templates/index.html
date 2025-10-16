@@ -56,7 +56,9 @@
     <img id="cam" src="/video.mjpg" alt="camera live">
   </div>
 
-  <!-- Use ES modules (no global THREE.*) -->
-  <script type="module" src="{{ url_for('static', filename='app.js') }}"></script>
-</body>
+  <!-- Load TWEEN.js from the local static folder -->
+  <script src="{{ url_for('static', filename='js/tween.umd.js') }}"></script>
+  <!-- This line for app.js remains the same -->
+  <script type="module" src="{{ url_for('static', filename='app.js') }}"></script></body>
+  
 </html>

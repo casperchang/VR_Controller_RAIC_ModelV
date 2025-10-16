@@ -1,3 +1,4 @@
 app.log
 temp.txt
 __pycache__/
+captured/
